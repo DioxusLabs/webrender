@@ -88,7 +88,7 @@ fn main() {
     );
 
     // A font instance per size, as WR would create for styled text runs.
-    let sizes: &[f32] = &[10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 24.0, 28.0, 32.0, 48.0];
+    let sizes: &[f32] = &[10.0, 16.0, 24.0, 48.0];
     let mut instances = Vec::new();
     for (i, &size) in sizes.iter().enumerate() {
         let instance_key = FontInstanceKey::new(namespace, 1 + i as u32);
@@ -130,8 +130,8 @@ fn main() {
         }
     }
 
-    // 4 subpixel offsets per glyph per size: 191 * 4 * 10 = 7640 unique
-    // requests per repeat.
+    // 4 subpixel offsets per glyph per size: 191 * 4 = 764 unique requests
+    // per size per repeat.
     let offsets = [0.0f32, 0.25, 0.5, 0.75];
     let mut per_instance_keys: Vec<Vec<GlyphKey>> = Vec::new();
     for font in &instances {
@@ -148,56 +148,57 @@ fn main() {
         }
         per_instance_keys.push(keys);
     }
-    let glyphs_per_repeat: usize = per_instance_keys.iter().map(|k| k.len()).sum();
-
     // Requests are submitted in chunks like WR text runs; the rasterizer's
     // own GLYPH_BATCH_SIZE batching/flushing then kicks in.
     const CHUNK: usize = 32;
 
-    let mut run = |glyph_rasterizer: &mut GlyphRasterizer| -> (std::time::Duration, usize) {
-        let start = Instant::now();
-        for (font, keys) in instances.iter().zip(&per_instance_keys) {
+    // Each font size is measured as its own request/resolve pass so results
+    // can be broken down by size.
+    for (i, (font, keys)) in instances.iter().zip(&per_instance_keys).enumerate() {
+        let mut run = |glyph_rasterizer: &mut GlyphRasterizer| -> (std::time::Duration, usize) {
+            let start = Instant::now();
             for chunk in keys.chunks(CHUNK) {
                 glyph_rasterizer.request_glyphs(font.clone(), chunk, |_| true);
             }
+            let mut ok = 0usize;
+            glyph_rasterizer.resolve_glyphs(
+                |job, _| {
+                    if let Ok(glyph) = job.result {
+                        std::hint::black_box(&glyph.bytes);
+                        ok += 1;
+                    }
+                },
+                &mut Profiler,
+            );
+            (start.elapsed(), ok)
+        };
+
+        // Warmup.
+        let (_, ok) = run(&mut glyph_rasterizer);
+
+        let mut times = Vec::new();
+        for _ in 0..repeats {
+            let (t, _) = run(&mut glyph_rasterizer);
+            times.push(t);
         }
-        let mut ok = 0usize;
-        glyph_rasterizer.resolve_glyphs(
-            |job, _| {
-                if let Ok(glyph) = job.result {
-                    std::hint::black_box(&glyph.bytes);
-                    ok += 1;
-                }
-            },
-            &mut Profiler,
+
+        let mean_ms = times.iter().map(|t| t.as_secs_f64()).sum::<f64>() / repeats as f64 * 1e3;
+        let min_ms = times
+            .iter()
+            .map(|t| t.as_secs_f64())
+            .fold(f64::INFINITY, f64::min)
+            * 1e3;
+        println!(
+            "MTRESULT {} workers={} size={} glyphs={} ok={} repeats={} mean_ms={:.2} min_ms={:.2} glyphs_per_sec={:.0}",
+            BACKEND,
+            num_workers,
+            sizes[i],
+            keys.len(),
+            ok,
+            repeats,
+            mean_ms,
+            min_ms,
+            keys.len() as f64 / (mean_ms / 1e3),
         );
-        (start.elapsed(), ok)
-    };
-
-    // Warmup.
-    let (_, ok) = run(&mut glyph_rasterizer);
-
-    let mut times = Vec::new();
-    for _ in 0..repeats {
-        let (t, _) = run(&mut glyph_rasterizer);
-        times.push(t);
     }
-
-    let mean_ms = times.iter().map(|t| t.as_secs_f64()).sum::<f64>() / repeats as f64 * 1e3;
-    let min_ms = times
-        .iter()
-        .map(|t| t.as_secs_f64())
-        .fold(f64::INFINITY, f64::min)
-        * 1e3;
-    println!(
-        "MTRESULT {} workers={} glyphs={} ok={} repeats={} mean_ms={:.1} min_ms={:.1} glyphs_per_sec={:.0}",
-        BACKEND,
-        num_workers,
-        glyphs_per_repeat,
-        ok,
-        repeats,
-        mean_ms,
-        min_ms,
-        glyphs_per_repeat as f64 / (mean_ms / 1e3),
-    );
 }
