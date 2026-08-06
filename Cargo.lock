@@ -873,6 +873,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "font-types"
+version = "0.12.3"
+source = "git+https://github.com/DioxusLabs/fontations?branch=devin%2Feblc-index-tables-size#971bbdfa2ef77efa2e895a85f0adadfa96516aa8"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
 name = "foreign-types"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1101,7 +1109,7 @@ dependencies = [
  "log",
  "peniko",
  "png 0.18.1",
- "skrifa",
+ "skrifa 0.44.0",
  "smallvec",
  "vello_common",
 ]
@@ -2475,7 +2483,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "046a7d674daf459825b32f5062056d6882db0d2f5a479fbd76ccfc870ac18709"
 dependencies = [
  "bytemuck",
- "font-types",
+ "font-types 0.12.2",
+ "once_cell",
+]
+
+[[package]]
+name = "read-fonts"
+version = "0.42.2"
+source = "git+https://github.com/DioxusLabs/fontations?branch=devin%2Feblc-index-tables-size#971bbdfa2ef77efa2e895a85f0adadfa96516aa8"
+dependencies = [
+ "bytemuck",
+ "font-types 0.12.3",
  "once_cell",
 ]
 
@@ -2792,7 +2810,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "819ab7d62b1d3e72d9d9dea5650bac30424f9111364bb94928dbf5ecad1baa68"
 dependencies = [
  "bytemuck",
- "read-fonts",
+ "read-fonts 0.41.0",
+]
+
+[[package]]
+name = "skrifa"
+version = "0.45.2"
+source = "git+https://github.com/DioxusLabs/fontations?branch=devin%2Feblc-index-tables-size#971bbdfa2ef77efa2e895a85f0adadfa96516aa8"
+dependencies = [
+ "bytemuck",
+ "read-fonts 0.42.2",
 ]
 
 [[package]]
@@ -3954,7 +3981,7 @@ dependencies = [
  "rayon",
  "rustc-hash 2.1.1",
  "serde",
- "skrifa",
+ "skrifa 0.45.2",
  "smallvec",
  "tracy-rs",
  "vello_cpu",

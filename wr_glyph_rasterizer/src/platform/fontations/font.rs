@@ -4,7 +4,7 @@ use api::{
     NativeFontHandle,
 };
 use memmap2::Mmap;
-use skrifa::bitmap::{BitmapData, BitmapFormat, BitmapGlyph, BitmapStrikes, MaskData, Origin};
+use skrifa::bitmap::{BitmapData, BitmapFormat, BitmapStrikes, Origin};
 use skrifa::charmap::Charmap;
 use skrifa::instance::Location;
 use skrifa::metrics::GlyphMetrics;
@@ -13,8 +13,7 @@ use skrifa::outline::{
     SmoothMode, Target,
 };
 use skrifa::prelude::{LocationRef, Size};
-use skrifa::raw::tables::bitmap as raw_bitmap;
-use skrifa::raw::{FileRef, FontData, TableProvider as _};
+use skrifa::raw::{FileRef, TableProvider as _};
 use skrifa::{GlyphId, MetadataProvider as _, Tag};
 use vello_cpu::kurbo::{expand_path, Affine, BezPath, Diagonal2, Join, Shape as _};
 use vello_cpu::peniko;
@@ -560,202 +559,6 @@ impl FontContext {
         })
     }
 
-    /// Locate a glyph's bitmap within an EBLC strike, resolving index
-    /// subtables against the full extent of the table rather than the
-    /// strike's declared `indexTablesSize`. Some fonts (e.g. Proggy) set
-    /// that field to the size of the index subtable array alone, excluding
-    /// the subtables it points to; skrifa bounds every subtable read by it
-    /// and so finds no bitmaps at all, whereas FreeType bounds reads by the
-    /// end of the EBLC table and renders these fonts fine.
-    fn lenient_strike_location(
-        size: &raw_bitmap::BitmapSize,
-        offset_data: FontData,
-        glyph_id: GlyphId,
-    ) -> Option<raw_bitmap::BitmapLocation> {
-        let gid = glyph_id.to_u32();
-        if gid < size.start_glyph_index().to_u32() || gid > size.end_glyph_index().to_u32() {
-            return None;
-        }
-        let list_data = offset_data.split_off(size.index_subtable_list_offset() as usize)?;
-        let list =
-            raw_bitmap::IndexSubtableList::read(list_data, size.number_of_index_subtables())
-                .ok()?;
-        for record in list.index_subtable_records() {
-            let first = record.first_glyph_index().to_u32();
-            let last = record.last_glyph_index().to_u32();
-            if !(first..=last).contains(&gid) {
-                continue;
-            }
-            let subtable = record.index_subtable(list.offset_data()).ok()?;
-            let glyph_ix = (gid - first) as usize;
-            let mut location = raw_bitmap::BitmapLocation {
-                bit_depth: size.bit_depth(),
-                ..Default::default()
-            };
-            match &subtable {
-                raw_bitmap::IndexSubtable::Format1(st) => {
-                    location.format = st.image_format();
-                    let start = st.image_data_offset() as usize
-                        + st.sbit_offsets().get(glyph_ix)?.get() as usize;
-                    let end = st.image_data_offset() as usize
-                        + st.sbit_offsets().get(glyph_ix + 1)?.get() as usize;
-                    location.data_offset = start;
-                    location.data_size = end.checked_sub(start)?;
-                }
-                raw_bitmap::IndexSubtable::Format2(st) => {
-                    location.format = st.image_format();
-                    let data_size = st.image_size() as usize;
-                    location.data_size = data_size;
-                    location.data_offset =
-                        st.image_data_offset() as usize + glyph_ix * data_size;
-                    location.metrics = Some(st.big_metrics()[0]);
-                }
-                raw_bitmap::IndexSubtable::Format3(st) => {
-                    location.format = st.image_format();
-                    let start = st.image_data_offset() as usize
-                        + st.sbit_offsets().get(glyph_ix)?.get() as usize;
-                    let end = st.image_data_offset() as usize
-                        + st.sbit_offsets().get(glyph_ix + 1)?.get() as usize;
-                    location.data_offset = start;
-                    location.data_size = end.checked_sub(start)?;
-                }
-                raw_bitmap::IndexSubtable::Format4(st) => {
-                    location.format = st.image_format();
-                    let array = st.glyph_array();
-                    let array_ix = array
-                        .binary_search_by(|x| x.glyph_id().to_u32().cmp(&gid))
-                        .ok()?;
-                    let start = array[array_ix].sbit_offset() as usize;
-                    let end = array.get(array_ix + 1)?.sbit_offset() as usize;
-                    location.data_offset = start;
-                    location.data_size = end.checked_sub(start)?;
-                }
-                raw_bitmap::IndexSubtable::Format5(st) => {
-                    location.format = st.image_format();
-                    let array = st.glyph_array();
-                    let array_ix = array
-                        .binary_search_by(|g| g.get().to_u32().cmp(&gid))
-                        .ok()?;
-                    let data_size = st.image_size() as usize;
-                    location.data_size = data_size;
-                    location.data_offset =
-                        st.image_data_offset() as usize + array_ix * data_size;
-                    location.metrics = Some(st.big_metrics()[0]);
-                }
-            }
-            return Some(location);
-        }
-        None
-    }
-
-    /// Build a [`BitmapGlyph`] from raw EBDT bitmap data, mirroring
-    /// skrifa's private `BitmapGlyph::from_bdt`.
-    fn bitmap_glyph_from_bdt<'a>(
-        size: &raw_bitmap::BitmapSize,
-        bitmap_data: &raw_bitmap::BitmapData<'a>,
-    ) -> Option<BitmapGlyph<'a>> {
-        let (inner_bearing_x, inner_bearing_y, advance, width, height) =
-            match &bitmap_data.metrics {
-                raw_bitmap::BitmapMetrics::Small(m) => (
-                    m.bearing_x() as f32,
-                    m.bearing_y() as f32,
-                    m.advance() as f32,
-                    m.width() as u32,
-                    m.height() as u32,
-                ),
-                raw_bitmap::BitmapMetrics::Big(m) => (
-                    m.hori_bearing_x() as f32,
-                    m.hori_bearing_y() as f32,
-                    m.hori_advance() as f32,
-                    m.width() as u32,
-                    m.height() as u32,
-                ),
-            };
-        let bpp = size.bit_depth();
-        let data = match bpp {
-            32 => match &bitmap_data.content {
-                raw_bitmap::BitmapContent::Data(raw_bitmap::BitmapDataFormat::Png, bytes) => {
-                    BitmapData::Png(bytes)
-                }
-                // 32-bit formats are always byte aligned.
-                raw_bitmap::BitmapContent::Data(
-                    raw_bitmap::BitmapDataFormat::ByteAligned,
-                    bytes,
-                ) => BitmapData::Bgra(bytes),
-                _ => return None,
-            },
-            1 | 2 | 4 | 8 => {
-                let (data, is_packed) = match &bitmap_data.content {
-                    raw_bitmap::BitmapContent::Data(
-                        raw_bitmap::BitmapDataFormat::ByteAligned,
-                        bytes,
-                    ) => (bytes, false),
-                    raw_bitmap::BitmapContent::Data(
-                        raw_bitmap::BitmapDataFormat::BitAligned,
-                        bytes,
-                    ) => (bytes, true),
-                    _ => return None,
-                };
-                BitmapData::Mask(MaskData {
-                    bpp,
-                    is_packed,
-                    data,
-                })
-            }
-            _ => return None,
-        };
-        Some(BitmapGlyph {
-            data,
-            bearing_x: 0.0,
-            bearing_y: 0.0,
-            inner_bearing_x,
-            inner_bearing_y,
-            ppem_x: size.ppem_x() as f32,
-            ppem_y: size.ppem_y() as f32,
-            width,
-            height,
-            advance: Some(advance),
-            placement_origin: Origin::TopLeft,
-        })
-    }
-
-    /// Fallback EBDT lookup for fonts whose strikes skrifa rejects (see
-    /// [`Self::lenient_strike_location`]). Selects the best strike for the
-    /// requested size using the same rules as skrifa's
-    /// `BitmapStrikes::glyph_for_size`: exact size, else nearest larger,
-    /// else nearest smaller.
-    fn lenient_ebdt_glyph<'a>(
-        font_ref: &skrifa::FontRef<'a>,
-        size: f32,
-        glyph_id: GlyphId,
-    ) -> Option<BitmapGlyph<'a>> {
-        let eblc = font_ref.eblc().ok()?;
-        let ebdt = font_ref.ebdt().ok()?;
-        let size = if size > 0.0 { size } else { f32::MAX };
-        let mut best: Option<(raw_bitmap::BitmapSize, raw_bitmap::BitmapLocation)> = None;
-        for strike in eblc.bitmap_sizes() {
-            let ppem = strike.ppem_y() as f32;
-            let better = match &best {
-                Some((best_strike, _)) => {
-                    let best_ppem = best_strike.ppem_y() as f32;
-                    (ppem >= size && ppem < best_ppem) || (best_ppem < size && ppem > best_ppem)
-                }
-                None => true,
-            };
-            if !better {
-                continue;
-            }
-            if let Some(location) =
-                Self::lenient_strike_location(strike, eblc.offset_data(), glyph_id)
-            {
-                best = Some((*strike, location));
-            }
-        }
-        let (strike, location) = best?;
-        let data = ebdt.data(&location).ok()?;
-        Self::bitmap_glyph_from_bdt(&strike, &data)
-    }
-
     /// Load an embedded bitmap (sbix/CBDT/EBDT) for a glyph, if the font
     /// provides one and the instance permits its use. Mirrors the FreeType
     /// backend: monochrome (EBDT) strikes require the EMBEDDED_BITMAPS
@@ -784,8 +587,7 @@ impl FontContext {
         let size_px = (req_size * y_scale) as f32;
         let bitmap = parsed
             .strikes
-            .glyph_for_size(Size::new(size_px), glyph_id)
-            .or_else(|| Self::lenient_ebdt_glyph(&parsed.font_ref, size_px, glyph_id))?;
+            .glyph_for_size(Size::new(size_px), glyph_id)?;
 
         // Zero-sized bitmaps (e.g. spaces) are kept so their metrics
         // (notably the advance) are still reported, matching FreeType;

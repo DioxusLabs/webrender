@@ -30,7 +30,7 @@ glean = { workspace = true, optional = true }
 firefox-on-glean = { version = "0.1.0", optional = true }
 serde = { optional = true, version = "1.0", features = ["serde_derive"] }
 vello_cpu = { version = "0.1.0", optional = true }
-skrifa = { version = "0.44", optional = true }
+skrifa = { git = "https://github.com/DioxusLabs/fontations", branch = "devin/eblc-index-tables-size", optional = true }
 memmap2 = { version = "0.9", optional = true }
 png = { version = "0.18", optional = true }
 yoke = { version = "0.8", optional = true }
