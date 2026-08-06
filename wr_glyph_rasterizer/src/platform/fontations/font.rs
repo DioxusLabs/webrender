@@ -15,16 +15,14 @@ use skrifa::outline::{
 use skrifa::prelude::{LocationRef, Size};
 use skrifa::raw::{FileRef, TableProvider as _};
 use skrifa::{GlyphId, MetadataProvider as _, Tag};
-use vello_cpu::kurbo::{expand_path, Affine, BezPath, Diagonal2, Join, Shape as _};
-use vello_cpu::peniko;
-use vello_cpu::{PaintType, PixmapMut, RenderContext, RenderSettings, Resources};
+use kurbo::{expand_path, Affine, BezPath, Diagonal2, Join, PathEl, Shape as _};
 use yoke::{Yoke, Yokeable};
+use zeno::{Command, Fill, Mask, Point, Scratch, Vector};
 
 use crate::{
     FastHashMap, FontInstance, GlyphFormat, GlyphKey, GlyphRasterError, GlyphRasterResult,
     RasterizedGlyph,
 };
-
 
 /// Resolve the hinting settings for a font instance, following the same
 /// rules as the FreeType backend: platform options select the hinting
@@ -126,6 +124,19 @@ impl OutlinePen for OutlinePath {
     fn close(&mut self) {
         self.path.close_path();
     }
+}
+
+/// Append the elements of a kurbo `BezPath` to a buffer of zeno path
+/// commands.
+fn bez_path_to_zeno(path: &BezPath, commands: &mut Vec<Command>) {
+    let point = |p: kurbo::Point| Point::new(p.x as f32, p.y as f32);
+    commands.extend(path.elements().iter().map(|el| match *el {
+        PathEl::MoveTo(p) => Command::MoveTo(point(p)),
+        PathEl::LineTo(p) => Command::LineTo(point(p)),
+        PathEl::QuadTo(c, p) => Command::QuadTo(point(c), point(p)),
+        PathEl::CurveTo(c0, c1, p) => Command::CurveTo(point(c0), point(c1), point(p)),
+        PathEl::ClosePath => Command::Close,
+    }));
 }
 
 /// Parsed views over a font's data, constructed once when the font is
@@ -281,8 +292,9 @@ pub struct FontContext {
     hinting_instance_cache: FastHashMap<(FontInstanceKey, u32, u32), Option<HintingInstance>>,
     location_cache: FastHashMap<FontInstanceKey, Location>,
     // Scratch state reused between glyphs to avoid per-glyph allocations.
-    render_context: RenderContext,
-    resources: Resources,
+    raster_scratch: Scratch,
+    scratch_commands: Vec<Command>,
+    scratch_mask: Vec<u8>,
     scratch_path: BezPath,
 }
 
@@ -317,18 +329,13 @@ impl FontContext {
         true
     }
     pub fn new() -> FontContext {
-        // Single-threaded rendering: WebRender already distributes glyph
-        // rasterization across its own worker threads.
-        let render_settings = RenderSettings {
-            num_threads: 0,
-            ..RenderSettings::default()
-        };
         FontContext {
             font_cache: Default::default(),
             hinting_instance_cache: Default::default(),
             location_cache: Default::default(),
-            render_context: RenderContext::new_with(0, 0, render_settings),
-            resources: Resources::new(),
+            raster_scratch: Scratch::new(),
+            scratch_commands: Vec::new(),
+            scratch_mask: Vec::new(),
             scratch_path: BezPath::new(),
         }
     }
@@ -731,28 +738,30 @@ impl FontContext {
         let width = dimensions.width as u16 + 2 * padding;
         let height = dimensions.height as u16 + 2 * padding;
 
-        let render_context = &mut self.render_context;
-        render_context.reset_and_resize(width, height);
+        // Rasterize an alpha coverage mask with zeno. Position the path so
+        // that its bounding box lands exactly on the mask: translate by
+        // (-left, top), i.e. by (-min_x, -min_y), plus the padding border.
+        let num_pixels = width as usize * height as usize;
+        self.scratch_commands.clear();
+        bez_path_to_zeno(&glyph.path, &mut self.scratch_commands);
+        self.scratch_mask.clear();
+        self.scratch_mask.resize(num_pixels, 0);
+        Mask::with_scratch(self.scratch_commands.as_slice(), &mut self.raster_scratch)
+            .style(Fill::NonZero)
+            .offset(Vector::new(
+                (padding as i32 - dimensions.left) as f32,
+                (padding as i32 + dimensions.top) as f32,
+            ))
+            .size(width as u32, height as u32)
+            .render_into(&mut self.scratch_mask, None);
 
-        // Render white coverage; the actual text color is applied by
-        // WebRender's shaders when compositing the glyph from the atlas.
-        render_context.set_paint(PaintType::Solid(peniko::Color::WHITE));
-
-        // Position the path so that its bounding box lands exactly on the
-        // pixmap: translate by (-left, top), i.e. by (-min_x, -min_y),
-        // plus the padding border.
-        render_context.set_transform(Affine::translate((
-            (padding as i32 - dimensions.left) as f64,
-            (padding as i32 + dimensions.top) as f64,
-        )));
-        render_context.fill_path(&glyph.path);
-        render_context.flush();
-
-        let mut buffer = vec![0; width as usize * height as usize * 4];
-        render_context.render(
-            PixmapMut::new(width, height, &mut buffer).unwrap(),
-            &mut self.resources,
-        );
+        // Expand the coverage to white premultiplied BGRA (coverage in all
+        // four channels); the actual text color is applied by WebRender's
+        // shaders when compositing the glyph from the atlas.
+        let mut buffer = vec![0; num_pixels * 4];
+        for (a, dst) in self.scratch_mask.iter().zip(buffer.chunks_exact_mut(4)) {
+            dst.fill(*a);
+        }
 
         self.scratch_path = glyph.path;
 
