@@ -15,16 +15,14 @@ use skrifa::outline::{
 use skrifa::prelude::{LocationRef, Size};
 use skrifa::raw::{FileRef, TableProvider as _};
 use skrifa::{GlyphId, MetadataProvider as _, Tag};
-use vello_cpu::kurbo::{expand_path, Affine, BezPath, Diagonal2, Join, Shape as _};
-use vello_cpu::peniko;
-use vello_cpu::{PaintType, PixmapMut, RenderContext, RenderSettings, Resources};
+use kurbo::{expand_path, Affine, BezPath, Diagonal2, Join, PathEl, Shape as _};
+use skia_safe::{surfaces, AlphaType, ColorType, ImageInfo, PaintStyle, PathBuilder, PathFillType};
 use yoke::{Yoke, Yokeable};
 
 use crate::{
     FastHashMap, FontInstance, GlyphFormat, GlyphKey, GlyphRasterError, GlyphRasterResult,
     RasterizedGlyph,
 };
-
 
 /// Resolve the hinting settings for a font instance, following the same
 /// rules as the FreeType backend: platform options select the hinting
@@ -125,6 +123,30 @@ impl OutlinePen for OutlinePath {
     #[inline]
     fn close(&mut self) {
         self.path.close_path();
+    }
+}
+
+/// Append the elements of a kurbo `BezPath` to a Skia path builder.
+fn bez_path_to_skia(path: &BezPath, out: &mut PathBuilder) {
+    let point = |p: kurbo::Point| skia_safe::Point::new(p.x as f32, p.y as f32);
+    for el in path.elements() {
+        match *el {
+            PathEl::MoveTo(p) => {
+                out.move_to(point(p));
+            }
+            PathEl::LineTo(p) => {
+                out.line_to(point(p));
+            }
+            PathEl::QuadTo(c, p) => {
+                out.quad_to(point(c), point(p));
+            }
+            PathEl::CurveTo(c0, c1, p) => {
+                out.cubic_to(point(c0), point(c1), point(p));
+            }
+            PathEl::ClosePath => {
+                out.close();
+            }
+        }
     }
 }
 
@@ -281,8 +303,8 @@ pub struct FontContext {
     hinting_instance_cache: FastHashMap<(FontInstanceKey, u32, u32), Option<HintingInstance>>,
     location_cache: FastHashMap<FontInstanceKey, Location>,
     // Scratch state reused between glyphs to avoid per-glyph allocations.
-    render_context: RenderContext,
-    resources: Resources,
+    scratch_skia_path: PathBuilder,
+    scratch_paint: skia_safe::Paint,
     scratch_path: BezPath,
 }
 
@@ -317,18 +339,18 @@ impl FontContext {
         true
     }
     pub fn new() -> FontContext {
-        // Single-threaded rendering: WebRender already distributes glyph
-        // rasterization across its own worker threads.
-        let render_settings = RenderSettings {
-            num_threads: 0,
-            ..RenderSettings::default()
-        };
+        // Render white coverage; the actual text color is applied by
+        // WebRender's shaders when compositing the glyph from the atlas.
+        let mut paint = skia_safe::Paint::default();
+        paint.set_anti_alias(true);
+        paint.set_style(PaintStyle::Fill);
+        paint.set_color(skia_safe::Color::WHITE);
         FontContext {
             font_cache: Default::default(),
             hinting_instance_cache: Default::default(),
             location_cache: Default::default(),
-            render_context: RenderContext::new_with(0, 0, render_settings),
-            resources: Resources::new(),
+            scratch_skia_path: PathBuilder::new(),
+            scratch_paint: paint,
             scratch_path: BezPath::new(),
         }
     }
@@ -735,28 +757,35 @@ impl FontContext {
         let width = dimensions.width as u16 + 2 * padding;
         let height = dimensions.height as u16 + 2 * padding;
 
-        let render_context = &mut self.render_context;
-        render_context.reset_and_resize(width, height);
-
-        // Render white coverage; the actual text color is applied by
-        // WebRender's shaders when compositing the glyph from the atlas.
-        render_context.set_paint(PaintType::Solid(peniko::Color::WHITE));
-
-        // Position the path so that its bounding box lands exactly on the
-        // pixmap: translate by (-left, top), i.e. by (-min_x, -min_y),
-        // plus the padding border.
-        render_context.set_transform(Affine::translate((
-            (padding as i32 - dimensions.left) as f64,
-            (padding as i32 + dimensions.top) as f64,
-        )));
-        render_context.fill_path(&glyph.path);
-        render_context.flush();
+        // Rasterize with Skia into a premultiplied BGRA8 buffer, as white
+        // anti-aliased coverage with the non-zero fill rule.
+        let builder = &mut self.scratch_skia_path;
+        builder.reset();
+        bez_path_to_skia(&glyph.path, builder);
+        builder.set_fill_type(PathFillType::Winding);
+        let skia_path = builder.snapshot();
 
         let mut buffer = vec![0; width as usize * height as usize * 4];
-        render_context.render(
-            PixmapMut::new(width, height, &mut buffer).unwrap(),
-            &mut self.resources,
+        let info = ImageInfo::new(
+            (width as i32, height as i32),
+            ColorType::BGRA8888,
+            AlphaType::Premul,
+            None,
         );
+        let row_bytes = width as usize * 4;
+        let mut surface = surfaces::wrap_pixels(&info, &mut buffer, row_bytes, None)
+            .ok_or(GlyphRasterError::LoadFailed)?;
+        let canvas = surface.canvas();
+
+        // Position the path so that its bounding box lands exactly on the
+        // surface: translate by (-left, top), i.e. by (-min_x, -min_y),
+        // plus the padding border.
+        canvas.translate((
+            (padding as i32 - dimensions.left) as f32,
+            (padding as i32 + dimensions.top) as f32,
+        ));
+        canvas.draw_path(&skia_path, &self.scratch_paint);
+        drop(surface);
 
         self.scratch_path = glyph.path;
 
