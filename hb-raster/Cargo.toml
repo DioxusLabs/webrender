@@ -1,0 +1,9 @@
+[package]
+name = "hb-raster"
+version = "0.70.0"
+authors = ["The Mozilla Project Developers"]
+description = "Analytic coverage rasterizer, a Rust port of HarfBuzz's hb-raster-draw.cc"
+license = "MIT"
+edition = "2018"
+
+[dependencies]
