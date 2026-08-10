@@ -1258,6 +1258,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hb-raster"
+version = "0.70.0"
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3944,6 +3948,7 @@ dependencies = [
  "glean",
  "glutin",
  "glutin-winit",
+ "hb-raster",
  "lazy_static",
  "libc",
  "log",
