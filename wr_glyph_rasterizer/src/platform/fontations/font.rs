@@ -15,9 +15,9 @@ use skrifa::outline::{
 use skrifa::prelude::{LocationRef, Size};
 use skrifa::raw::{FileRef, TableProvider as _};
 use skrifa::{GlyphId, MetadataProvider as _, Tag};
-use vello_cpu::kurbo::{expand_path, Affine, BezPath, Diagonal2, Join, Shape as _};
-use vello_cpu::peniko;
-use vello_cpu::{PaintType, PixmapMut, RenderContext, RenderSettings, Resources};
+use hb_raster::{Extents, Raster};
+use vello_cpu::kurbo::{expand_path, Affine, BezPath, Diagonal2, Join, PathEl, Shape as _};
+use vello_cpu::{RenderContext, RenderSettings, Resources};
 use yoke::{Yoke, Yokeable};
 
 use crate::{
@@ -281,9 +281,12 @@ pub struct FontContext {
     hinting_instance_cache: FastHashMap<(FontInstanceKey, u32, u32), Option<HintingInstance>>,
     location_cache: FastHashMap<FontInstanceKey, Location>,
     // Scratch state reused between glyphs to avoid per-glyph allocations.
-    render_context: RenderContext,
-    resources: Resources,
+    raster: Raster,
+    scratch_alpha: Vec<u8>,
     scratch_path: BezPath,
+    // Vello is only needed for paths we do not rasterize ourselves (color
+    // outlines), so it is constructed on demand.
+    vello: Option<(RenderContext, Resources)>,
 }
 
 /// A glyph outline loaded for a particular font instance, in y-down
@@ -323,14 +326,35 @@ impl FontContext {
             num_threads: 0,
             ..RenderSettings::default()
         };
+        let _ = render_settings;
         FontContext {
             font_cache: Default::default(),
             hinting_instance_cache: Default::default(),
             location_cache: Default::default(),
-            render_context: RenderContext::new_with(0, 0, render_settings),
-            resources: Resources::new(),
+            raster: Raster::new(),
+            scratch_alpha: Vec::new(),
             scratch_path: BezPath::new(),
+            vello: None,
         }
+    }
+
+    /// The vello render context, created on first use. Kept for glyph
+    /// kinds that the analytic rasterizer does not handle (color
+    /// outlines).
+    #[allow(dead_code)]
+    fn vello(&mut self) -> &mut (RenderContext, Resources) {
+        self.vello.get_or_insert_with(|| {
+            // Single-threaded rendering: WebRender already distributes
+            // glyph rasterization across its own worker threads.
+            let render_settings = RenderSettings {
+                num_threads: 0,
+                ..RenderSettings::default()
+            };
+            (
+                RenderContext::new_with(0, 0, render_settings),
+                Resources::new(),
+            )
+        })
     }
     pub fn begin_rasterize(font: &FontInstance) {
         // TODO: apply instance properties
@@ -735,28 +759,51 @@ impl FontContext {
         let width = dimensions.width as u16 + 2 * padding;
         let height = dimensions.height as u16 + 2 * padding;
 
-        let render_context = &mut self.render_context;
-        render_context.reset_and_resize(width, height);
-
-        // Render white coverage; the actual text color is applied by
-        // WebRender's shaders when compositing the glyph from the atlas.
-        render_context.set_paint(PaintType::Solid(peniko::Color::WHITE));
-
         // Position the path so that its bounding box lands exactly on the
-        // pixmap: translate by (-left, top), i.e. by (-min_x, -min_y),
-        // plus the padding border.
-        render_context.set_transform(Affine::translate((
-            (padding as i32 - dimensions.left) as f64,
-            (padding as i32 + dimensions.top) as f64,
-        )));
-        render_context.fill_path(&glyph.path);
-        render_context.flush();
+        // output: translate by (-left, top), i.e. by (-min_x, -min_y),
+        // plus the padding border. The rasterizer has no transform of its
+        // own, so this is applied to the coordinates as they are fed in.
+        let tx = (padding as i32 - dimensions.left) as f32;
+        let ty = (padding as i32 + dimensions.top) as f32;
+        for el in glyph.path.elements() {
+            match *el {
+                PathEl::MoveTo(p) => self.raster.move_to(p.x as f32 + tx, p.y as f32 + ty),
+                PathEl::LineTo(p) => self.raster.line_to(p.x as f32 + tx, p.y as f32 + ty),
+                PathEl::QuadTo(c, p) => self.raster.quad_to(
+                    c.x as f32 + tx,
+                    c.y as f32 + ty,
+                    p.x as f32 + tx,
+                    p.y as f32 + ty,
+                ),
+                PathEl::CurveTo(c0, c1, p) => self.raster.curve_to(
+                    c0.x as f32 + tx,
+                    c0.y as f32 + ty,
+                    c1.x as f32 + tx,
+                    c1.y as f32 + ty,
+                    p.x as f32 + tx,
+                    p.y as f32 + ty,
+                ),
+                PathEl::ClosePath => self.raster.close_path(),
+            }
+        }
 
-        let mut buffer = vec![0; width as usize * height as usize * 4];
-        render_context.render(
-            PixmapMut::new(width, height, &mut buffer).unwrap(),
-            &mut self.resources,
-        );
+        let extents = Extents {
+            x0: 0,
+            y0: 0,
+            width: width as u32,
+            height: height as u32,
+        };
+        let num_pixels = width as usize * height as usize;
+        self.scratch_alpha.clear();
+        self.scratch_alpha.resize(num_pixels, 0);
+        self.raster
+            .render(extents, width as usize, &mut self.scratch_alpha);
+
+        // Expand the A8 coverage to premultiplied white RGBA.
+        let mut buffer = vec![0; num_pixels * 4];
+        for (a, dst) in self.scratch_alpha.iter().zip(buffer.chunks_exact_mut(4)) {
+            dst.fill(*a);
+        }
 
         self.scratch_path = glyph.path;
 

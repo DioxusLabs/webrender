@@ -10,7 +10,7 @@ edition = "2018"
 default = ["static_freetype"]
 dynamic_freetype = []
 static_freetype = ["freetype/freetype-sys"]
-fontations = ["vello_cpu", "skrifa", "memmap2", "png", "yoke", "api/fontations"]
+fontations = ["vello_cpu", "hb-raster", "skrifa", "memmap2", "png", "yoke", "api/fontations"]
 capture = ["api/serialize", "serde", "smallvec/serde"]
 replay = ["api/deserialize", "serde", "smallvec/serde"]
 gecko = ["firefox-on-glean", "glean"]
@@ -30,6 +30,7 @@ glean = { workspace = true, optional = true }
 firefox-on-glean = { version = "0.1.0", optional = true }
 serde = { optional = true, version = "1.0", features = ["serde_derive"] }
 vello_cpu = { version = "0.1.0", optional = true }
+hb-raster = { version = "0.70", path = "../hb-raster", optional = true }
 skrifa = { version = "0.44", optional = true }
 memmap2 = { version = "0.9", optional = true }
 png = { version = "0.18", optional = true }
