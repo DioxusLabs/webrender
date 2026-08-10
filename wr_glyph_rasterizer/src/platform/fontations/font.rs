@@ -738,15 +738,14 @@ impl FontContext {
         let width = dimensions.width as u16 + 2 * padding;
         let height = dimensions.height as u16 + 2 * padding;
 
-        // Rasterize an alpha coverage (A8) mask with zeno. Position the path
-        // so that its bounding box lands exactly on the mask: translate by
+        // Rasterize an alpha coverage mask with zeno. Position the path so
+        // that its bounding box lands exactly on the mask: translate by
         // (-left, top), i.e. by (-min_x, -min_y), plus the padding border.
-        // The rasterizer expands the mask to BGRA later only if the texture
-        // cache cannot use R8 textures.
         let num_pixels = width as usize * height as usize;
         self.scratch_commands.clear();
         bez_path_to_zeno(&glyph.path, &mut self.scratch_commands);
-        let mut buffer = vec![0; num_pixels];
+        self.scratch_mask.clear();
+        self.scratch_mask.resize(num_pixels, 0);
         Mask::with_scratch(self.scratch_commands.as_slice(), &mut self.raster_scratch)
             .style(Fill::NonZero)
             .offset(Vector::new(
@@ -754,7 +753,15 @@ impl FontContext {
                 (padding as i32 + dimensions.top) as f32,
             ))
             .size(width as u32, height as u32)
-            .render_into(&mut buffer, None);
+            .render_into(&mut self.scratch_mask, None);
+
+        // Expand the coverage to white premultiplied BGRA (coverage in all
+        // four channels); the actual text color is applied by WebRender's
+        // shaders when compositing the glyph from the atlas.
+        let mut buffer = vec![0; num_pixels * 4];
+        for (a, dst) in self.scratch_mask.iter().zip(buffer.chunks_exact_mut(4)) {
+            dst.fill(*a);
+        }
 
         self.scratch_path = glyph.path;
 

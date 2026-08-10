@@ -1729,14 +1729,7 @@ fn pack_glyph_variants_horizontal(variants: &[RasterizedGlyph]) -> RasterizedGly
         .max().unwrap();
 
     let packed_width = slot_width * 4;
-    // Backends produce either 32-bit BGRA or 8-bit A8 alpha coverage glyphs.
-    let bpp = variants
-        .iter()
-        .find_map(|v| {
-            let num_pixels = (v.width * v.height) as usize;
-            (num_pixels != 0).then(|| (v.bytes.len() / num_pixels) as i32)
-        })
-        .unwrap_or(4);
+    let bpp = 4;
 
     let mut packed_bytes = vec![0u8; (packed_width * slot_height * bpp) as usize];
 
@@ -1833,17 +1826,11 @@ fn process_glyph(
     };
 
     if let Ok(ref mut glyph) = job.result {
-        // Sanity check. Backends produce either 32-bit BGRA glyphs or, for
-        // alpha coverage, possibly 8-bit A8 glyphs.
-        let num_pixels = (glyph.width * glyph.height) as usize;
-        let is_a8 = glyph.bytes.len() == num_pixels;
-        assert!(
-            glyph.bytes.len() == 4 * num_pixels ||
-                (is_a8 &&
-                    matches!(
-                        glyph.format,
-                        GlyphFormat::Alpha | GlyphFormat::TransformedAlpha
-                    ))
+        // Sanity check.
+        let bpp = 4; // We always render glyphs in 32 bits RGBA format.
+        assert_eq!(
+            glyph.bytes.len(),
+            bpp * (glyph.width * glyph.height) as usize
         );
 
         // a quick-and-dirty monochrome over
@@ -1866,23 +1853,14 @@ fn process_glyph(
         // Check if the glyph has a bitmap that needs to be downscaled.
         glyph.downscale_bitmap_if_required(&job.font);
 
-        // Convert between BGRA8 and R8 if the backend's output format does
-        // not match the desired texture cache format.
+        // Convert from BGRA8 to R8 if required. In the future we can make it the
+        // backends' responsibility to output glyphs in the desired format,
+        // potentially reducing the number of copies.
         if glyph.format.image_format(can_use_r8_format).bytes_per_pixel() == 1 {
-            if !is_a8 {
-                glyph.bytes = glyph.bytes
-                    .chunks_mut(4)
-                    .map(|pixel| pixel[3])
-                    .collect::<Vec<_>>();
-            }
-        } else if is_a8 {
-            // Expand A8 coverage to white premultiplied BGRA (coverage in
-            // all four channels).
-            let mut bytes = vec![0; glyph.bytes.len() * 4];
-            for (a, dst) in glyph.bytes.iter().zip(bytes.chunks_exact_mut(4)) {
-                dst.fill(*a);
-            }
-            glyph.bytes = bytes;
+            glyph.bytes = glyph.bytes
+                .chunks_mut(4)
+                .map(|pixel| pixel[3])
+                .collect::<Vec<_>>();
         }
     }
 
