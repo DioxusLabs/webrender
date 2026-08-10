@@ -6,4 +6,9 @@ description = "Analytic coverage rasterizer, a Rust port of HarfBuzz's hb-raster
 license = "MIT"
 edition = "2018"
 
+[features]
+# Force the scalar coverage sweep even on architectures that have a SIMD
+# implementation. Only useful for benchmarking and differential testing.
+scalar_sweep = []
+
 [dependencies]

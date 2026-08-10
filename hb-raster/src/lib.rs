@@ -603,6 +603,8 @@ fn edge_sweep_row(
     }
 }
 
+const COVER_SCALE: i32 = 2 * ONE_PIXEL;
+
 /// Convert cover-delta + area to alpha bytes, then clear them.
 /// Returns the final cover accumulator over `[x_min, x_max]`.
 fn sweep_row_to_alpha(
@@ -612,9 +614,155 @@ fn sweep_row_to_alpha(
     x_min: usize,
     x_max: usize,
 ) -> i32 {
-    const COVER_SCALE: i32 = 2 * ONE_PIXEL;
-    let mut cover_accum = 0i32;
+    #[cfg(all(target_arch = "x86_64", not(feature = "scalar_sweep")))]
+    {
+        // SSE2 is baseline on x86_64, so no runtime detection is needed.
+        let (x, accum) = unsafe { sweep_row_to_alpha_sse2(row_buf, area, cover, x_min, x_max) };
+        return sweep_row_to_alpha_scalar(row_buf, area, cover, x, x_max, accum);
+    }
+    #[cfg(all(target_arch = "aarch64", not(feature = "scalar_sweep")))]
+    {
+        let (x, accum) = unsafe { sweep_row_to_alpha_neon(row_buf, area, cover, x_min, x_max) };
+        return sweep_row_to_alpha_scalar(row_buf, area, cover, x, x_max, accum);
+    }
+    #[cfg(not(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        not(feature = "scalar_sweep")
+    )))]
+    sweep_row_to_alpha_scalar(row_buf, area, cover, x_min, x_max, 0)
+}
 
+/// Eight columns at a time with SSE2. Returns the first column left
+/// unprocessed together with the running cover accumulator.
+#[cfg(all(target_arch = "x86_64", not(feature = "scalar_sweep")))]
+#[inline]
+unsafe fn sweep_row_to_alpha_sse2(
+    row_buf: &mut [u8],
+    area: &mut [i32],
+    cover: &mut [i16],
+    x_min: usize,
+    x_max: usize,
+) -> (usize, i32) {
+    use core::arch::x86_64::*;
+
+    let clamp_v = _mm_set1_epi32(FULL_COVERAGE);
+    let bias_v = _mm_set1_epi32(FULL_COVERAGE / 2);
+    let zero_v = _mm_setzero_si128();
+
+    let mut cover_accum = 0i32;
+    let mut x = x_min;
+    while x + 7 <= x_max {
+        let mut ctmp = [0i32; 8];
+        for (i, c) in ctmp.iter_mut().enumerate() {
+            cover_accum += *cover.get_unchecked(x + i) as i32;
+            *c = cover_accum.wrapping_mul(COVER_SCALE);
+        }
+
+        let c0 = _mm_loadu_si128(ctmp.as_ptr() as *const __m128i);
+        let c1 = _mm_loadu_si128(ctmp.as_ptr().add(4) as *const __m128i);
+        let a0 = _mm_loadu_si128(area.as_ptr().add(x) as *const __m128i);
+        let a1 = _mm_loadu_si128(area.as_ptr().add(x + 4) as *const __m128i);
+
+        let mut v0 = _mm_sub_epi32(c0, a0);
+        let mut v1 = _mm_sub_epi32(c1, a1);
+
+        // Absolute value without SSSE3.
+        let s0 = _mm_srai_epi32(v0, 31);
+        let s1 = _mm_srai_epi32(v1, 31);
+        v0 = _mm_sub_epi32(_mm_xor_si128(v0, s0), s0);
+        v1 = _mm_sub_epi32(_mm_xor_si128(v1, s1), s1);
+
+        let lt0 = _mm_cmplt_epi32(v0, clamp_v);
+        let lt1 = _mm_cmplt_epi32(v1, clamp_v);
+        v0 = _mm_or_si128(_mm_and_si128(lt0, v0), _mm_andnot_si128(lt0, clamp_v));
+        v1 = _mm_or_si128(_mm_and_si128(lt1, v1), _mm_andnot_si128(lt1, clamp_v));
+
+        // (v * 255 + bias) >> 17, with v * 255 computed as (v << 8) - v.
+        let r0 = _mm_srai_epi32(
+            _mm_add_epi32(_mm_sub_epi32(_mm_slli_epi32(v0, 8), v0), bias_v),
+            2 * PIXEL_BITS + 1,
+        );
+        let r1 = _mm_srai_epi32(
+            _mm_add_epi32(_mm_sub_epi32(_mm_slli_epi32(v1, 8), v1), bias_v),
+            2 * PIXEL_BITS + 1,
+        );
+
+        let h = _mm_packs_epi32(r0, r1);
+        let b = _mm_packus_epi16(h, h);
+        _mm_storel_epi64(row_buf.as_mut_ptr().add(x) as *mut __m128i, b);
+
+        _mm_storeu_si128(area.as_mut_ptr().add(x) as *mut __m128i, zero_v);
+        _mm_storeu_si128(area.as_mut_ptr().add(x + 4) as *mut __m128i, zero_v);
+        _mm_storeu_si128(cover.as_mut_ptr().add(x) as *mut __m128i, zero_v);
+
+        x += 8;
+    }
+
+    (x, cover_accum)
+}
+
+/// Eight columns at a time with NEON. Returns the first column left
+/// unprocessed together with the running cover accumulator.
+#[cfg(all(target_arch = "aarch64", not(feature = "scalar_sweep")))]
+#[inline]
+unsafe fn sweep_row_to_alpha_neon(
+    row_buf: &mut [u8],
+    area: &mut [i32],
+    cover: &mut [i16],
+    x_min: usize,
+    x_max: usize,
+) -> (usize, i32) {
+    use core::arch::aarch64::*;
+
+    let clamp_v = vdupq_n_s32(FULL_COVERAGE);
+    let bias_v = vdupq_n_s32(FULL_COVERAGE / 2);
+    let zero32 = vdupq_n_s32(0);
+    let zero16 = vdupq_n_s16(0);
+
+    let mut cover_accum = 0i32;
+    let mut x = x_min;
+    while x + 7 <= x_max {
+        let mut ctmp = [0i32; 8];
+        for (i, c) in ctmp.iter_mut().enumerate() {
+            cover_accum += *cover.get_unchecked(x + i) as i32;
+            *c = cover_accum.wrapping_mul(COVER_SCALE);
+        }
+
+        let c0 = vld1q_s32(ctmp.as_ptr());
+        let c1 = vld1q_s32(ctmp.as_ptr().add(4));
+        let a0 = vld1q_s32(area.as_ptr().add(x));
+        let a1 = vld1q_s32(area.as_ptr().add(x + 4));
+
+        let v0 = vminq_s32(vabsq_s32(vsubq_s32(c0, a0)), clamp_v);
+        let v1 = vminq_s32(vabsq_s32(vsubq_s32(c1, a1)), clamp_v);
+
+        let r0 = vshrq_n_s32::<{ 2 * PIXEL_BITS + 1 }>(vmlaq_n_s32(bias_v, v0, 255));
+        let r1 = vshrq_n_s32::<{ 2 * PIXEL_BITS + 1 }>(vmlaq_n_s32(bias_v, v1, 255));
+
+        let h = vcombine_s16(vmovn_s32(r0), vmovn_s32(r1));
+        vst1_u8(row_buf.as_mut_ptr().add(x), vqmovun_s16(h));
+
+        vst1q_s32(area.as_mut_ptr().add(x), zero32);
+        vst1q_s32(area.as_mut_ptr().add(x + 4), zero32);
+        vst1q_s16(cover.as_mut_ptr().add(x), zero16);
+
+        x += 8;
+    }
+
+    (x, cover_accum)
+}
+
+fn sweep_row_to_alpha_scalar(
+    row_buf: &mut [u8],
+    area: &mut [i32],
+    cover: &mut [i16],
+    x_min: usize,
+    x_max: usize,
+    mut cover_accum: i32,
+) -> i32 {
+    if x_min > x_max {
+        return cover_accum;
+    }
     for x in x_min ..= x_max {
         cover_accum += cover[x] as i32;
         let val = cover_accum * COVER_SCALE - area[x];
