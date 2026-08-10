@@ -56,6 +56,8 @@ struct Scenario {
     render_mode: FontRenderMode,
     transform: FontTransform,
     subpx_offsets: &'static [f32],
+    /// Use the CJK workload charset instead of ASCII+Latin-1.
+    cjk: bool,
     /// Measure get_glyph_dimensions instead of rasterize_glyph.
     dimensions_only: bool,
     /// Recreate the FontContext (and re-add fonts) before every iteration,
@@ -74,6 +76,7 @@ impl Scenario {
             render_mode: FontRenderMode::Alpha,
             transform: FontTransform::identity(),
             subpx_offsets: &[0.0],
+            cjk: false,
             dimensions_only: false,
             fresh_context: false,
         }
@@ -116,6 +119,25 @@ fn workload_glyph_indices(context: &mut FontContext, font_key: FontKey) -> Vec<u
     indices
 }
 
+/// A CJK workload: ~160 ideographs sampled across the URO block plus a set
+/// of especially stroke-dense characters.
+fn cjk_glyph_indices(context: &mut FontContext, font_key: FontKey) -> Vec<u32> {
+    let mut chars: Vec<char> = (0x4E00u32..0x9FA5).step_by(347)
+        .filter_map(char::from_u32)
+        .collect();
+    // Stroke-dense / complex ideographs.
+    chars.extend("龘龖靉鬱鮤鹾囔灩籲蠻鑬鮯鱲鸯讞讚釁雞鐹鑾翮餞餎餮囊蠇讓讐麩黤黹黽齏爨瑩琺".chars());
+    let mut indices = Vec::new();
+    for ch in chars {
+        if let Some(index) = context.get_glyph_index(font_key, ch) {
+            if index != 0 {
+                indices.push(index);
+            }
+        }
+    }
+    indices
+}
+
 fn make_keys(scenario: &Scenario, indices: &[u32], instance: &FontInstance) -> Vec<GlyphKey> {
     let subpx_dir = instance.get_subpx_dir();
     let mut keys = Vec::new();
@@ -143,7 +165,11 @@ fn run_scenario(scenario: &Scenario, fonts: &[FontSpec], instance_id: u32) {
 
     let instance = make_instance(scenario, instance_id);
     let font_key = FontKey::new(NAMESPACE, scenario.font_id);
-    let indices = workload_glyph_indices(&mut context, font_key);
+    let indices = if scenario.cjk {
+        cjk_glyph_indices(&mut context, font_key)
+    } else {
+        workload_glyph_indices(&mut context, font_key)
+    };
     let keys = make_keys(scenario, &indices, &instance);
     assert!(!keys.is_empty());
 
@@ -227,11 +253,16 @@ fn main() {
     let root = std::env::var("WR_ROOT").unwrap_or_else(|_| ".".to_string());
     let font_path = |name: &str| format!("{}/wrench/reftests/text/{}", root, name);
 
-    let fonts = vec![
+    let mut fonts = vec![
         load_font(&font_path("FreeSans.ttf"), 0),
         load_font(&font_path("Proggy.ttf"), 1),
         load_font(&font_path("VeraBd.ttf"), 2),
     ];
+    // Optional CJK font (e.g. Noto Sans SC); enables the cjk_* scenarios.
+    let cjk_font = std::env::var("WR_CJK_FONT").ok();
+    if let Some(path) = &cjk_font {
+        fonts.push(load_font(path, 3));
+    }
 
     let rotate30 = {
         let (s, c) = (30f32.to_radians().sin(), 30f32.to_radians().cos());
@@ -287,6 +318,19 @@ fn main() {
             ..Scenario::base("fresh_context_16px", 16.0)
         },
     ];
+
+    if cjk_font.is_some() {
+        for &size in &[16.0f32, 24.0, 48.0] {
+            let name: &'static str = Box::leak(
+                format!("cjk_alpha_{}px", size as u32).into_boxed_str(),
+            );
+            scenarios.push(Scenario {
+                font_id: 3,
+                cjk: true,
+                ..Scenario::base(name, size)
+            });
+        }
+    }
 
     if let Ok(filter) = std::env::var("BENCH_FILTER") {
         scenarios.retain(|s| s.name.contains(&filter));
