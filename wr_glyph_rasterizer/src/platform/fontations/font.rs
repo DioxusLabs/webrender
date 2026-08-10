@@ -305,6 +305,7 @@ pub struct FontContext {
     // Scratch state reused between glyphs to avoid per-glyph allocations.
     scratch_skia_path: PathBuilder,
     scratch_paint: skia_safe::Paint,
+    scratch_mask: Vec<u8>,
     scratch_path: BezPath,
 }
 
@@ -351,6 +352,7 @@ impl FontContext {
             location_cache: Default::default(),
             scratch_skia_path: PathBuilder::new(),
             scratch_paint: paint,
+            scratch_mask: Vec::new(),
             scratch_path: BezPath::new(),
         }
     }
@@ -765,16 +767,16 @@ impl FontContext {
         builder.set_fill_type(PathFillType::Winding);
         let skia_path = builder.snapshot();
 
-        let mut buffer = vec![0; width as usize * height as usize * 4];
-        let info = ImageInfo::new(
-            (width as i32, height as i32),
-            ColorType::BGRA8888,
-            AlphaType::Premul,
-            None,
-        );
-        let row_bytes = width as usize * 4;
-        let mut surface = surfaces::wrap_pixels(&info, &mut buffer, row_bytes, None)
-            .ok_or(GlyphRasterError::LoadFailed)?;
+        // Draw coverage into a single-channel A8 mask, the same layout
+        // Skia's own glyph pipeline uses; its A8 blitters are considerably
+        // faster than blending into a 4-channel surface.
+        let num_pixels = width as usize * height as usize;
+        self.scratch_mask.clear();
+        self.scratch_mask.resize(num_pixels, 0);
+        let info = ImageInfo::new_a8((width as i32, height as i32));
+        let mut surface =
+            surfaces::wrap_pixels(&info, &mut self.scratch_mask, width as usize, None)
+                .ok_or(GlyphRasterError::LoadFailed)?;
         let canvas = surface.canvas();
 
         // Position the path so that its bounding box lands exactly on the
@@ -786,6 +788,14 @@ impl FontContext {
         ));
         canvas.draw_path(&skia_path, &self.scratch_paint);
         drop(surface);
+
+        // Expand the coverage to white premultiplied BGRA (coverage in all
+        // four channels); the actual text color is applied by WebRender's
+        // shaders when compositing the glyph from the atlas.
+        let mut buffer = vec![0; num_pixels * 4];
+        for (a, dst) in self.scratch_mask.iter().zip(buffer.chunks_exact_mut(4)) {
+            dst.fill(*a);
+        }
 
         self.scratch_path = glyph.path;
 
