@@ -6,6 +6,10 @@
 
 Build `wrench` with `cargo build --release` within the `wrench` directory.
 
+The native glyph backend is selected by default on every OS. To opt into the
+glyphrast backend, build with `cargo build --release --features fontations`.
+For software rendering, use `--features software,fontations` instead.
+
 ## headless
 
 `wrench` has an optional headless mode for use in continuous integration. To run in headless mode, instead of using `cargo run -- args`, use `./headless.py args`.

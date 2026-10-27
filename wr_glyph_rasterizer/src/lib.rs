@@ -42,9 +42,9 @@ extern crate malloc_size_of;
 pub mod platform {
     #[cfg(all(any(target_os = "ios", target_os = "macos"), not(feature = "fontations")))]
     pub use crate::platform::macos::font;
-    #[cfg(any(target_os = "android", all(unix, not(any(target_os = "ios", target_os = "macos", feature = "fontations")))))]
+    #[cfg(all(not(feature = "fontations"), any(target_os = "android", all(unix, not(any(target_os = "ios", target_os = "macos"))))))]
     pub use crate::platform::unix::font;
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "windows", not(feature = "fontations")))]
     pub use crate::platform::windows::font;
 
     #[cfg(feature = "fontations")]
@@ -59,11 +59,11 @@ pub mod platform {
     pub mod macos {
         pub mod font;
     }
-    #[cfg(any(target_os = "android", all(unix, not(any(target_os = "macos", target_os = "ios", feature = "fontations")))))]
+    #[cfg(all(not(feature = "fontations"), any(target_os = "android", all(unix, not(any(target_os = "macos", target_os = "ios"))))))]
     pub mod unix {
         pub mod font;
     }
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "windows", not(feature = "fontations")))]
     pub mod windows {
         pub mod font;
     }

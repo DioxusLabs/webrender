@@ -1,9 +1,19 @@
 # Glyphrast backend
 
 The `fontations` feature uses glyphrast at revision
-`08e742ba11d6a63971483eaf732dd714fe4a3c90`. Wrench enables this feature on
-its WebRender dependency; build it with `cargo build --release --features software`
-from `wrench/`.
+`08e742ba11d6a63971483eaf732dd714fe4a3c90`. It is opt-in on every OS;
+without it, WebRender and Wrench use the native glyph backend (FreeType on
+Linux/Android, DirectWrite on Windows, CoreText on macOS/iOS). Native
+dependencies remain linked even when fontations is selected.
+
+From `wrench/`, build the glyphrast software renderer with
+`cargo build --release --features software,fontations`, then run
+`target/release/wrench --headless --software reftest reftests/text`.
+For the native backend, omit `fontations`: `cargo build --release --features software`.
+From the repository root, opt in with `--features fontations` when building
+`webrender` or `wr_glyph_rasterizer`. Both `glyph_bench` and `glyph_bench_mt`
+support either backend; their documented `--features fontations` commands
+select glyphrast, while their default commands select the native backend.
 
 ## Caching
 
@@ -373,4 +383,25 @@ Four-worker glyph_bench_mt, five repeats, mean milliseconds:
 These whole-pipeline runs include worker scheduling and are noisier than the
 single-thread microbenchmarks. Raw follow-up logs, probes and Callgrind
 profiles from this machine are retained in /home/ubuntu/glyphrast-results/.
-Cross-platform builds and color-font visual checks remain unverified.
+Cross-platform builds and color-font visual checks were not verified in that
+follow-up; see the compile checks below.
+
+## Opt-in backend verification
+
+Linux `cargo check -p wr_glyph_rasterizer` passed both with defaults and with
+`--features fontations`. Both benchmark examples compiled in both modes;
+they do not require fontations. Library tests passed: 4 native, 9 fontations.
+
+With `--features fontations`, `cargo check -p wr_glyph_rasterizer --target ...`
+also passed for `x86_64-pc-windows-gnu`, `aarch64-apple-darwin`,
+`aarch64-apple-ios`, and `aarch64-linux-android`. These are compile checks,
+not cross-platform linking or runtime tests; native dependencies are unchanged.
+
+Wrench's default feature graph excludes fontations; enabling its `fontations`
+feature selects `webrender/fontations` and `wr_glyph_rasterizer/fontations`.
+Release software text reftests passed 48/48 with the default FreeType backend.
+The explicit glyphrast run passed 46/48: the known mono `snap-clip` difference
+(1 pixel, maximum difference 3) and the previously observed atlas-sensitive
+`split-batch` difference (1514 pixels, maximum difference 2, tolerance 1510).
+No rasterization code or test tolerances changed in this feature-wiring update.
+Color-font visual checks remain unverified.
