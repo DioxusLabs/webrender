@@ -8,7 +8,7 @@ use api::{
 };
 use glyphrast::image::{Content, Image};
 use glyphrast::read_fonts::types::{GlyphId, Tag};
-use glyphrast::zeno::{Format, Transform, Vector};
+use glyphrast::zeno::{bounds, Fill, Format, Transform, Vector};
 use glyphrast::{Font, Hinting, RasterTarget, Render, Source, StrikeWith};
 use memmap2::Mmap;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -93,6 +93,7 @@ pub struct FontContext {
     location_cache: FastHashMap<(u64, FontInstanceKey), Font>,
     context: glyphrast::RasterContext,
     image: Image,
+    outline: glyphrast::outline::Outline,
     next_key: u64,
 }
 
@@ -106,6 +107,7 @@ impl FontContext {
             location_cache: Default::default(),
             context: glyphrast::RasterContext::new(),
             image: Image::new(),
+            outline: glyphrast::outline::Outline::new(),
             next_key: 0,
         }
     }
@@ -154,7 +156,12 @@ impl FontContext {
             .map_unicode(ch)
             .map(|id| id.to_u32())
     }
-    fn render(&mut self, instance: &FontInstance, key: &GlyphKey) -> Option<f32> {
+    fn render(
+        &mut self,
+        instance: &FontInstance,
+        key: &GlyphKey,
+        dimensions_only: bool,
+    ) -> Option<f32> {
         self.image.clear();
         let cached = self.font_cache.get(&instance.font_key)?;
         let font = self
@@ -207,13 +214,16 @@ impl FontContext {
         } else {
             0.0
         };
-        let advance = font
-            .glyph_metrics()
-            .scaled_f32(size)
-            .h_advance(GlyphId::new(key.index()))
-            * shape.scale_x
-            * aspect
-            + bold;
+        let advance = if dimensions_only {
+            font.glyph_metrics()
+                .scaled_f32(size)
+                .h_advance(GlyphId::new(key.index()))
+                * shape.scale_x
+                * aspect
+                + bold
+        } else {
+            0.0
+        };
         let mut scaler = self
             .context
             .builder(font, cached.key)
@@ -230,11 +240,34 @@ impl FontContext {
             sources[2] = Source::Bitmap(StrikeWith::BestFit);
         }
         let (dx, dy) = instance.get_subpx_offset(key);
+        let offset = Vector::new(dx as f32, -dy as f32);
+        if dimensions_only
+            && !scaler.has_color_outlines()
+            && !scaler.has_color_bitmaps()
+            && !(instance.flags.contains(FontInstanceFlags::EMBEDDED_BITMAPS)
+                && scaler.has_bitmaps())
+        {
+            scaler.scale_outline_into(key.index(), &mut self.outline)?;
+            if bold != 0.0 {
+                self.outline.embolden(bold, bold);
+            }
+            self.outline.transform(&transform);
+            let mut bounds = bounds(self.outline.path(), Fill::NonZero, None);
+            bounds.min = (bounds.min + offset).floor();
+            bounds.max = (bounds.max + offset).ceil();
+            self.image.placement = glyphrast::zeno::Placement {
+                left: bounds.min.x as i32,
+                top: bounds.max.y as i32,
+                width: bounds.width() as u32,
+                height: bounds.height() as u32,
+            };
+            return Some(advance);
+        }
         let format = if instance.render_mode == FontRenderMode::Subpixel {
             if instance.flags.contains(FontInstanceFlags::SUBPIXEL_BGR) {
-                Format::Subpixel
-            } else {
                 Format::subpixel_bgra()
+            } else {
+                Format::Subpixel
             }
         } else {
             Format::Alpha
@@ -242,7 +275,7 @@ impl FontContext {
         let rendered = Render::new(&sources)
             .format(format)
             .transform(Some(transform))
-            .offset(Vector::new(dx as f32, -dy as f32))
+            .offset(offset)
             .embolden(bold)
             .default_color([255, 255, 255, 255])
             .render_into(&mut scaler, key.index(), &mut self.image);
@@ -257,7 +290,7 @@ impl FontContext {
         instance: &FontInstance,
         key: &GlyphKey,
     ) -> Option<GlyphDimensions> {
-        let advance = self.render(instance, key)?;
+        let advance = self.render(instance, key, true)?;
         let image = &self.image;
         Some(GlyphDimensions {
             left: image.placement.left,
@@ -272,7 +305,7 @@ impl FontContext {
         instance: &FontInstance,
         key: &GlyphKey,
     ) -> GlyphRasterResult {
-        self.render(instance, key)
+        self.render(instance, key, false)
             .ok_or(GlyphRasterError::LoadFailed)?;
         let image = &self.image;
         let p = image.placement;
@@ -284,17 +317,27 @@ impl FontContext {
         let height = p.height as usize + 2 * padding;
         let mut bytes = vec![0; width * height * 4];
         for y in 0..p.height as usize {
-            for x in 0..p.width as usize {
-                let i = y * p.width as usize + x;
-                let dst = &mut bytes[((y + padding) * width + x + padding) * 4..][..4];
-                match image.content {
-                    Content::Mask => dst.fill(image.data[i]),
-                    Content::SubpixelMask => {
-                        dst.copy_from_slice(&image.data[i * 4..][..4]);
+            let start = ((y + padding) * width + padding) * 4;
+            let row = &mut bytes[start..start + p.width as usize * 4];
+            let src_start = y * p.width as usize;
+            match image.content {
+                Content::Mask => {
+                    let src = &image.data[src_start..src_start + p.width as usize];
+                    for (dst, &alpha) in row.chunks_exact_mut(4).zip(src) {
+                        dst.copy_from_slice(&[alpha; 4]);
+                    }
+                }
+                Content::SubpixelMask => {
+                    row.copy_from_slice(
+                        &image.data[src_start * 4..(src_start + p.width as usize) * 4],
+                    );
+                    for dst in row.chunks_exact_mut(4) {
                         dst[3] = dst[0].max(dst[1]).max(dst[2]);
                     }
-                    Content::Color => {
-                        let src = &image.data[i * 4..][..4];
+                }
+                Content::Color => {
+                    let src = &image.data[src_start * 4..(src_start + p.width as usize) * 4];
+                    for (dst, src) in row.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
                         let a = src[3] as u32;
                         dst.copy_from_slice(&[
                             ((src[2] as u32 * a + 128) / 255) as u8,
@@ -329,7 +372,7 @@ impl FontContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::BaseFontInstance;
+    use crate::{BaseFontInstance, FontTransform, SubpixelDirection};
     use api::{units::DevicePoint, FontInstanceOptions, IdNamespace};
 
     fn setup() -> (FontContext, FontInstance) {
@@ -393,10 +436,77 @@ mod tests {
         );
         instance.flags.insert(FontInstanceFlags::EMBEDDED_BITMAPS);
         let index = context.get_glyph_index(instance.font_key, 'A').unwrap();
+        let dimensions = context
+            .get_glyph_dimensions(&instance, &glyph(index))
+            .unwrap();
         let result = context.rasterize_glyph(&instance, &glyph(index)).unwrap();
+        assert_eq!(
+            (dimensions.width, dimensions.height),
+            (result.width, result.height)
+        );
         assert!(matches!(result.format, GlyphFormat::Bitmap));
         assert!(result.width > 0 && result.height > 0);
         assert!(result.bytes.iter().any(|b| *b != 0));
+    }
+
+    #[test]
+    fn outline_dimensions_match_rendering() {
+        let (mut context, mut instance) = setup();
+        for (transform, italics) in [
+            FontTransform::identity(),
+            FontTransform::new(0.866, -0.5, 0.5, 0.866),
+            FontTransform::new(1.0, 0.25, 0.0, 1.0),
+            FontTransform::new(-1.5, 0.0, 0.0, 0.75),
+        ]
+        .iter()
+        .copied()
+        .flat_map(|transform| {
+            [false, true]
+                .iter()
+                .copied()
+                .map(move |italics| (transform, italics))
+        }) {
+            instance.transform = transform;
+            Arc::make_mut(&mut instance.base).options.synthetic_italics = if italics {
+                api::SyntheticItalics::enabled()
+            } else {
+                api::SyntheticItalics::disabled()
+            };
+            for flags in [
+                FontInstanceFlags::empty(),
+                FontInstanceFlags::SYNTHETIC_BOLD,
+            ] {
+                instance.flags = flags | FontInstanceFlags::SUBPIXEL_POSITION;
+                for mode in [FontRenderMode::Alpha, FontRenderMode::Subpixel] {
+                    instance.render_mode = mode;
+                    for direction in [SubpixelDirection::Horizontal, SubpixelDirection::Vertical] {
+                        for offset in [0.0, 0.25, 0.5, 0.75] {
+                            for ch in ' '..='ÿ' {
+                                let Some(index) = context.get_glyph_index(instance.font_key, ch)
+                                else {
+                                    continue;
+                                };
+                                let key = GlyphKey::new(
+                                    index,
+                                    DevicePoint::new(offset, offset),
+                                    direction,
+                                );
+                                let d = context.get_glyph_dimensions(&instance, &key).unwrap();
+                                assert!(context.image.data.is_empty());
+                                context.render(&instance, &key, false).unwrap();
+                                let p = context.image.placement;
+                                assert_eq!((d.left, d.top, d.width, d.height),
+                                           (p.left, p.top, p.width as i32, p.height as i32),
+                                           "{ch:?} {offset} {direction:?} {mode:?} {flags:?} {transform:?}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(context
+            .get_glyph_dimensions(&instance, &glyph(0xffff))
+            .is_none());
     }
 
     #[test]
@@ -408,10 +518,26 @@ mod tests {
         let unpadded = context.rasterize_glyph(&instance, &key).unwrap();
         assert!(matches!(unpadded.format, GlyphFormat::Subpixel));
         assert!(unpadded.bytes.chunks_exact(4).any(|p| p[0] != p[2]));
+        let right_edge = unpadded
+            .bytes
+            .chunks_exact(unpadded.width as usize * 4)
+            .map(|row| &row[row.len() - 4..]);
+        let (b, r) = right_edge.fold((0u32, 0u32), |(b, r), p| (b + p[0] as u32, r + p[2] as u32));
+        assert!(r > b);
         assert!(unpadded
             .bytes
             .chunks_exact(4)
             .all(|p| p[3] == p[0].max(p[1]).max(p[2])));
+        instance.flags.insert(FontInstanceFlags::SUBPIXEL_BGR);
+        let bgr = context.rasterize_glyph(&instance, &key).unwrap();
+        for (rgb, bgr) in unpadded
+            .bytes
+            .chunks_exact(4)
+            .zip(bgr.bytes.chunks_exact(4))
+        {
+            assert_eq!(rgb, &[bgr[2], bgr[1], bgr[0], bgr[3]]);
+        }
+        instance.flags.remove(FontInstanceFlags::SUBPIXEL_BGR);
         instance.flags.insert(FontInstanceFlags::TEXTURE_PADDING);
         let padded = context.rasterize_glyph(&instance, &key).unwrap();
         assert_eq!(padded.width, unpadded.width + 2);
