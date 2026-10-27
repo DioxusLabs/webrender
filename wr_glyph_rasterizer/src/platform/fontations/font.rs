@@ -1,227 +1,65 @@
-use std::{path::PathBuf, sync::Arc};
-use api::{
-    ColorU, FontInstanceFlags, FontInstanceKey, FontKey, FontRenderMode, GlyphDimensions,
-    NativeFontHandle,
-};
-use memmap2::Mmap;
-use skrifa::bitmap::{BitmapData, BitmapFormat, BitmapStrikes, Origin};
-use skrifa::charmap::Charmap;
-use skrifa::instance::Location;
-use skrifa::metrics::GlyphMetrics;
-use skrifa::outline::{
-    DrawSettings, Engine, HintingInstance, HintingOptions, OutlineGlyphCollection, OutlinePen,
-    SmoothMode, Target,
-};
-use skrifa::prelude::{LocationRef, Size};
-use skrifa::raw::{FileRef, TableProvider as _};
-use skrifa::{GlyphId, MetadataProvider as _, Tag};
-use vello_cpu::kurbo::{expand_path, Affine, BezPath, Diagonal2, Join, Shape as _};
-use vello_cpu::peniko;
-use vello_cpu::{PaintType, PixmapMut, RenderContext, RenderSettings, Resources};
-use yoke::{Yoke, Yokeable};
-
 use crate::{
     FastHashMap, FontInstance, GlyphFormat, GlyphKey, GlyphRasterError, GlyphRasterResult,
     RasterizedGlyph,
 };
+use api::{
+    ColorU, FontInstanceFlags, FontInstanceKey, FontKey, FontRenderMode, GlyphDimensions,
+    NativeFontHandle,
+};
+use glyphrast::image::{Content, Image};
+use glyphrast::read_fonts::types::{GlyphId, Tag};
+use glyphrast::zeno::{Format, Transform, Vector};
+use glyphrast::{Font, Hinting, RasterTarget, Render, Source, StrikeWith};
+use memmap2::Mmap;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use skrifa::raw::FileRef;
+use std::sync::Arc;
 
-
-/// Resolve the hinting settings for a font instance, following the same
-/// rules as the FreeType backend: platform options select the hinting
-/// target, FORCE_AUTOHINT/NO_AUTOHINT select the engine, and hinting is
-/// disabled entirely under non-axis-aligned transforms or synthetic
-/// italics. Returns `None` when hinting is disabled, otherwise the
-/// options along with a small tag for use in the hinting-instance cache
-/// key.
-fn hinting_options(font: &FontInstance) -> Option<(HintingOptions, u32)> {
-    // Disable hinting if there is a non-axis-aligned transform.
-    if font.synthetic_italics.is_enabled() ||
-        ((font.transform.scale_x != 0.0 || font.transform.scale_y != 0.0) &&
-         (font.transform.skew_x != 0.0 || font.transform.skew_y != 0.0))
+fn hinting(font: &FontInstance) -> Hinting {
+    if font.synthetic_italics.is_enabled()
+        || ((font.transform.scale_x != 0.0 || font.transform.scale_y != 0.0)
+            && (font.transform.skew_x != 0.0 || font.transform.skew_y != 0.0))
     {
-        return None;
+        return Hinting::None;
     }
-
-    // Hinting platform options only exist on FreeType platforms; elsewhere
-    // use the standard smooth target.
     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "windows")))]
     let target = {
         use api::FontHinting;
-        let hinting = font.platform_options.unwrap_or_default().hinting;
-        match (hinting, font.render_mode) {
-            (FontHinting::None, _) => return None,
-            (FontHinting::Mono, _) => Target::Mono,
-            (FontHinting::Light, _) => Target::from(SmoothMode::Light),
+        match (
+            font.platform_options.unwrap_or_default().hinting,
+            font.render_mode,
+        ) {
+            (FontHinting::None, _) => return Hinting::None,
+            (FontHinting::Light, _) => RasterTarget::Light,
             (FontHinting::LCD, FontRenderMode::Subpixel) => {
                 if font.flags.contains(FontInstanceFlags::LCD_VERTICAL) {
-                    Target::from(SmoothMode::VerticalLcd)
+                    RasterTarget::VerticalLcd
                 } else {
-                    Target::from(SmoothMode::Lcd)
+                    RasterTarget::Lcd
                 }
             }
-            _ => Target::from(SmoothMode::Normal),
+            _ => RasterTarget::Normal,
         }
     };
     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "windows"))]
-    let target = Target::from(SmoothMode::Normal);
-    let engine = if font.flags.contains(FontInstanceFlags::FORCE_AUTOHINT) {
-        Engine::Auto(None)
+    let target = RasterTarget::Normal;
+    if font.flags.contains(FontInstanceFlags::FORCE_AUTOHINT) {
+        Hinting::Auto(target)
     } else if font.flags.contains(FontInstanceFlags::NO_AUTOHINT) {
-        Engine::Interpreter
+        Hinting::Interpreter(target)
     } else {
-        Engine::AutoFallback
-    };
-
-    let target_tag = match target {
-        Target::Mono => 0,
-        Target::Smooth { mode: SmoothMode::Normal, .. } => 1,
-        Target::Smooth { mode: SmoothMode::Light, .. } => 2,
-        Target::Smooth { mode: SmoothMode::Lcd, .. } => 3,
-        Target::Smooth { mode: SmoothMode::VerticalLcd, .. } => 4,
-    };
-    let engine_tag = match engine {
-        Engine::Interpreter => 0,
-        Engine::Auto(_) => 1,
-        Engine::AutoFallback => 2,
-    };
-
-    Some((HintingOptions { engine, target }, target_tag | (engine_tag << 3)))
-}
-
-#[derive(Clone, Default)]
-pub(crate) struct OutlinePath {
-    pub(crate) path: BezPath,
-}
-
-impl OutlinePath {
-    pub(crate) fn reuse(&mut self) {
-        self.path.truncate(0);
+        Hinting::AutoFallback(target)
     }
 }
 
-// Note that we flip the y-axis to match our coordinate system (y-down, origin
-// at the baseline).
-impl OutlinePen for OutlinePath {
-    #[inline]
-    fn move_to(&mut self, x: f32, y: f32) {
-        self.path.move_to((x, -y));
-    }
-
-    #[inline]
-    fn line_to(&mut self, x: f32, y: f32) {
-        self.path.line_to((x, -y));
-    }
-
-    #[inline]
-    fn curve_to(&mut self, cx0: f32, cy0: f32, cx1: f32, cy1: f32, x: f32, y: f32) {
-        self.path.curve_to((cx0, -cy0), (cx1, -cy1), (x, -y));
-    }
-
-    #[inline]
-    fn quad_to(&mut self, cx: f32, cy: f32, x: f32, y: f32) {
-        self.path.quad_to((cx, -cy), (x, -y));
-    }
-
-    #[inline]
-    fn close(&mut self) {
-        self.path.close_path();
-    }
-}
-
-/// Parsed views over a font's data, constructed once when the font is
-/// registered and reused for every glyph. All of these are zerocopy views
-/// borrowing from the font bytes owned by the enclosing [`CachedFont`].
-struct ParsedFont<'a> {
-    font_ref: skrifa::FontRef<'a>,
-    outlines: OutlineGlyphCollection<'a>,
-    charmap: Charmap<'a>,
-    strikes: BitmapStrikes<'a>,
-    units_per_em: f32,
-}
-
-impl<'a> ParsedFont<'a> {
-    fn new(data: &'a [u8], index: u32) -> Option<ParsedFont<'a>> {
-        let font_ref = skrifa::FontRef::from_index(data, index).ok()?;
-        let outlines = font_ref.outline_glyphs();
-        let charmap = font_ref.charmap();
-        let strikes = BitmapStrikes::new(&font_ref);
-        let units_per_em = font_ref.head().ok()?.units_per_em() as f32;
-        Some(ParsedFont {
-            font_ref,
-            outlines,
-            charmap,
-            strikes,
-            units_per_em,
-        })
-    }
-}
-
-// SAFETY: ParsedFont's fields are all zerocopy views over `&'a [u8]` and are
-// covariant in 'a; the transmutes only change the lifetime parameter.
-unsafe impl<'a> Yokeable<'a> for ParsedFont<'static> {
-    type Output = ParsedFont<'a>;
-
-    #[inline]
-    fn transform(&'a self) -> &'a ParsedFont<'a> {
-        unsafe { std::mem::transmute(self) }
-    }
-
-    #[inline]
-    fn transform_owned(self) -> ParsedFont<'a> {
-        unsafe { std::mem::transmute(self) }
-    }
-
-    #[inline]
-    unsafe fn make(from: ParsedFont<'a>) -> Self {
-        std::mem::transmute(from)
-    }
-
-    #[inline]
-    fn transform_mut<F>(&'a mut self, f: F)
-    where
-        F: 'static + for<'b> FnOnce(&'b mut Self::Output),
-    {
-        unsafe { f(std::mem::transmute::<&mut Self, &mut Self::Output>(self)) }
-    }
-}
-
-/// A registered font: the (possibly memory-mapped) font bytes together with
-/// the parsed skrifa views into them.
 struct CachedFont {
-    parsed: Yoke<ParsedFont<'static>, Arc<dyn AsRef<[u8]> + Send + Sync>>,
-}
-
-impl CachedFont {
-    fn new(data: Arc<dyn AsRef<[u8]> + Send + Sync>, index: u32) -> Option<CachedFont> {
-        let parsed = Yoke::try_attach_to_cart(data, |data| {
-            ParsedFont::new(data.as_ref(), index).ok_or(())
-        })
-        .ok()?;
-        Some(CachedFont { parsed })
-    }
-
-    #[inline]
-    fn parsed(&self) -> &ParsedFont<'_> {
-        self.parsed.get()
-    }
+    font: Font,
+    key: glyphrast::FontKey,
 }
 
 struct SimpleFontHandle {
-    pub path: PathBuf,
     pub index: u32,
     pub data: Mmap,
-}
-
-impl SimpleFontHandle {
-    pub(crate) fn new(path: PathBuf, index: u32) -> Self {
-        let file = std::fs::File::open(&path).unwrap();
-        let mapped = unsafe { Mmap::map(&file) }.unwrap();
-        Self {
-            path,
-            index,
-            data: mapped,
-        }
-    }
 }
 
 impl From<NativeFontHandle> for SimpleFontHandle {
@@ -231,7 +69,6 @@ impl From<NativeFontHandle> for SimpleFontHandle {
         let mapped = unsafe { Mmap::map(&file) }.unwrap();
 
         SimpleFontHandle {
-            path: native.path,
             index: native.index,
             data: mapped,
         }
@@ -245,581 +82,360 @@ impl From<NativeFontHandle> for SimpleFontHandle {
         let index = ttc_index_from_postscript_name(font_file, &native.name);
 
         SimpleFontHandle {
-            path: PathBuf::from(native.path),
             index,
             data: mapped,
         }
     }
 }
 
-trait RasterContext {
-    // Static fns
-    fn distribute_across_threads() -> bool;
-    fn new() -> Self;
-    fn begin_rasterize(font: &FontInstance);
-    fn end_rasterize(font: &FontInstance);
-    fn prepare_font(font: &mut FontInstance);
-
-    // Font registration
-    fn add_raw_font(&mut self, font_key: &FontKey, bytes: Arc<Vec<u8>>, index: u32);
-    fn add_native_font(&mut self, font_key: &FontKey, native_font_handle: NativeFontHandle);
-    fn delete_font(&mut self, font_key: &FontKey);
-    fn delete_font_instance(&mut self, instance: &FontInstance);
-
-    // Methods
-    fn get_glyph_index(&mut self, font_key: FontKey, ch: char) -> Option<u32>;
-    fn get_glyph_dimensions(
-        &mut self,
-        font: &FontInstance,
-        key: &GlyphKey,
-    ) -> Option<GlyphDimensions>;
-    fn rasterize_glyph(&mut self, font: &FontInstance, key: &GlyphKey) -> GlyphRasterResult;
-}
-
 pub struct FontContext {
     font_cache: FastHashMap<FontKey, CachedFont>,
-    hinting_instance_cache: FastHashMap<(FontInstanceKey, u32, u32), Option<HintingInstance>>,
-    location_cache: FastHashMap<FontInstanceKey, Location>,
-    // Scratch state reused between glyphs to avoid per-glyph allocations.
-    render_context: RenderContext,
-    resources: Resources,
-    scratch_path: BezPath,
-}
-
-/// A glyph outline loaded for a particular font instance, in y-down
-/// coordinates relative to the baseline origin, with the subpixel offset
-/// already applied.
-struct LoadedGlyph {
-    path: BezPath,
-    dimensions: GlyphDimensions,
-}
-
-/// An embedded bitmap glyph decoded to premultiplied BGRA8 at the strike's
-/// native resolution, with placement in strike pixels.
-struct LoadedBitmap {
-    buffer: Vec<u8>,
-    width: i32,
-    height: i32,
-    /// Left bearing in strike pixels.
-    left: i32,
-    /// Distance from the baseline up to the top edge, in strike pixels.
-    top: i32,
-    /// Scale from strike pixels to requested device pixels.
-    scale: f32,
-    /// Advance in requested device pixels.
-    advance: f32,
-    format: GlyphFormat,
+    location_cache: FastHashMap<(u64, FontInstanceKey), Font>,
+    context: glyphrast::RasterContext,
+    image: Image,
+    next_key: u64,
 }
 
 impl FontContext {
-    // Static fns
     pub fn distribute_across_threads() -> bool {
         true
     }
-    pub fn new() -> FontContext {
-        // Single-threaded rendering: WebRender already distributes glyph
-        // rasterization across its own worker threads.
-        let render_settings = RenderSettings {
-            num_threads: 0,
-            ..RenderSettings::default()
-        };
-        FontContext {
+    pub fn new() -> Self {
+        Self {
             font_cache: Default::default(),
-            hinting_instance_cache: Default::default(),
             location_cache: Default::default(),
-            render_context: RenderContext::new_with(0, 0, render_settings),
-            resources: Resources::new(),
-            scratch_path: BezPath::new(),
+            context: glyphrast::RasterContext::new(),
+            image: Image::new(),
+            next_key: 0,
         }
     }
-    pub fn begin_rasterize(font: &FontInstance) {
-        // TODO: apply instance properties
-    }
-    pub fn end_rasterize(font: &FontInstance) {
-        // TODO: clear instance properties
-    }
-
+    pub fn begin_rasterize(_: &FontInstance) {}
+    pub fn end_rasterize(_: &FontInstance) {}
     pub fn prepare_font(font: &mut FontInstance) {
-        // Subpixel AA (LCD) rendering is not supported yet; fall back to
-        // grayscale alpha so WebRender does not expect per-channel coverage.
-        font.disable_subpixel_aa();
-        match font.render_mode {
-            FontRenderMode::Mono => {
-                // In mono mode the color of the font is irrelevant.
-                font.color = ColorU::new(0xFF, 0xFF, 0xFF, 0xFF);
-                // Subpixel positioning is disabled in mono mode.
-                font.disable_subpixel_position();
-            }
-            FontRenderMode::Alpha | FontRenderMode::Subpixel => {
-                // We produce coverage in all channels, so color is unused.
-                font.color = ColorU::new(0xFF, 0xFF, 0xFF, 0xFF);
-            }
+        font.color = ColorU::new(255, 255, 255, 255);
+        if font.render_mode == FontRenderMode::Mono {
+            font.disable_subpixel_position();
+        }
+    }
+    pub fn add_raw_font(&mut self, key: &FontKey, bytes: Arc<Vec<u8>>, index: u32) {
+        self.add_font(key, bytes, index);
+    }
+    fn add_font(&mut self, key: &FontKey, bytes: Arc<dyn AsRef<[u8]> + Send + Sync>, index: u32) {
+        if let Some(font) = Font::new(bytes, index) {
+            self.delete_font(key);
+            self.next_key += 1;
+            self.font_cache.insert(
+                *key,
+                CachedFont {
+                    font,
+                    key: glyphrast::FontKey(self.next_key),
+                },
+            );
+        }
+    }
+    pub fn add_native_font(&mut self, key: &FontKey, native: NativeFontHandle) {
+        let handle = SimpleFontHandle::from(native);
+        self.add_font(key, Arc::new(handle.data), handle.index);
+    }
+    pub fn delete_font(&mut self, key: &FontKey) {
+        if let Some(font) = self.font_cache.remove(key) {
+            self.location_cache.retain(|(id, _), _| *id != font.key.0);
         }
     }
     pub fn delete_font_instance(&mut self, instance: &FontInstance) {
-        self.hinting_instance_cache
-            .retain(|(key, ..), _| *key != instance.base.instance_key);
-        self.location_cache.remove(&instance.base.instance_key);
+        self.location_cache
+            .retain(|(_, key), _| *key != instance.base.instance_key);
     }
-
-    pub fn add_raw_font(&mut self, font_key: &FontKey, bytes: Arc<Vec<u8>>, index: u32) {
-        if let Some(font) = CachedFont::new(bytes, index) {
-            self.font_cache.insert(*font_key, font);
-        }
+    pub fn get_glyph_index(&mut self, key: FontKey, ch: char) -> Option<u32> {
+        self.font_cache
+            .get(&key)?
+            .font
+            .charmap()
+            .map_unicode(ch)
+            .map(|id| id.to_u32())
     }
-    pub fn add_native_font(&mut self, font_key: &FontKey, native_font_handle: NativeFontHandle) {
-        let handle = SimpleFontHandle::from(native_font_handle);
-        if let Some(font) = CachedFont::new(Arc::new(handle.data), handle.index) {
-            self.font_cache.insert(*font_key, font);
-        }
-    }
-    pub fn delete_font(&mut self, font_key: &FontKey) {
-        self.font_cache.remove(font_key);
-    }
-
-    // Methods
-    pub fn get_glyph_index(&mut self, font_key: FontKey, ch: char) -> Option<u32> {
-        let parsed = self.font_cache.get(&font_key)?.parsed();
-        let glyph_id = parsed.charmap.map(ch)?;
-        Some(glyph_id.to_u32())
-    }
-
-    /// Resolve (and cache) the variation location for a font instance.
-    /// Variations are fixed per instance key, so the location only needs to
-    /// be computed once.
-    fn instance_location<'a>(
-        location_cache: &'a mut FastHashMap<FontInstanceKey, Location>,
-        parsed: &ParsedFont,
-        font_instance: &FontInstance,
-    ) -> &'a Location {
-        location_cache
-            .entry(font_instance.base.instance_key)
+    fn render(&mut self, instance: &FontInstance, key: &GlyphKey) -> Option<f32> {
+        self.image.clear();
+        let cached = self.font_cache.get(&instance.font_key)?;
+        let font = self
+            .location_cache
+            .entry((cached.key.0, instance.base.instance_key))
             .or_insert_with(|| {
-                parsed.font_ref.axes().location(
-                    font_instance
-                        .base
-                        .variations
-                        .iter()
-                        .map(|v| (Tag::from_be_bytes(v.tag.to_be_bytes()), v.value)),
-                )
-            })
-    }
-
-    /// Load the outline for a glyph, hinted if possible, with the subpixel
-    /// offset applied. Returns the path (y-down, baseline origin) together
-    /// with metrics and the tight device-pixel dimensions of the path.
-    fn load_glyph(
-        &mut self,
-        font_instance: &FontInstance,
-        key: &GlyphKey,
-    ) -> Option<LoadedGlyph> {
-        let parsed = self.font_cache.get(&font_instance.font_key)?.parsed();
-        let location =
-            Self::instance_location(&mut self.location_cache, parsed, font_instance);
-        let location_ref = LocationRef::from(location);
-
-        let req_size = font_instance.size.to_f64_px();
-        let (x_scale, y_scale) = font_instance
-            .transform
-            .compute_scale()
-            .unwrap_or((1.0, 1.0));
-        // Rasterize at a uniform size scaled by the transform's y-scale; the
-        // x/y aspect ratio and the residual (unit-determinant) part of the
-        // transform are applied to the outline path below.
-        let font_size = (req_size * y_scale) as f32;
-
-        // The residual shape of the transform once the scale is factored out,
-        // expressed directly in our y-down path coordinate space.
-        let mut shape = font_instance.transform.invert_scale(x_scale, y_scale);
-        if font_instance.flags.contains(FontInstanceFlags::FLIP_X) {
+                cached
+                    .font
+                    .instance_builder()
+                    .variations(
+                        instance
+                            .base
+                            .variations
+                            .iter()
+                            .map(|v| (Tag::from_be_bytes(v.tag.to_be_bytes()), v.value)),
+                    )
+                    .build()
+            });
+        let req_size = instance.size.to_f64_px();
+        let (x_scale, y_scale) = instance.transform.compute_scale().unwrap_or((1.0, 1.0));
+        let size = (req_size * y_scale) as f32;
+        let mut shape = instance.transform.invert_scale(x_scale, y_scale);
+        if instance.flags.contains(FontInstanceFlags::FLIP_X) {
             shape = shape.flip_x();
         }
-        if font_instance.flags.contains(FontInstanceFlags::FLIP_Y) {
+        if instance.flags.contains(FontInstanceFlags::FLIP_Y) {
             shape = shape.flip_y();
         }
-        if font_instance.flags.contains(FontInstanceFlags::TRANSPOSE) {
+        if instance.flags.contains(FontInstanceFlags::TRANSPOSE) {
             shape = shape.swap_xy();
         }
         let (mut tx, mut ty) = (0.0, 0.0);
-        if font_instance.synthetic_italics.is_enabled() {
-            let (shape_, (tx_, ty_)) =
-                font_instance.synthesize_italics(shape, req_size * y_scale);
-            shape = shape_;
-            tx = tx_;
-            ty = ty_;
+        if instance.synthetic_italics.is_enabled() {
+            let (s, (x, y)) = instance.synthesize_italics(shape, req_size * y_scale);
+            shape = s;
+            tx = x;
+            ty = y;
         }
-        let aspect = x_scale / y_scale;
-        // Column-major [a, b, c, d, e, f]: x' = a*x + c*y + e, y' = b*x + d*y + f.
-        let affine = Affine::new([
-            shape.scale_x as f64 * aspect,
-            shape.skew_y as f64 * aspect,
-            shape.skew_x as f64,
-            shape.scale_y as f64,
-            tx,
-            ty,
-        ]);
-        let identity_shape = affine == Affine::IDENTITY;
-
-        let glyph_metrics =
-            GlyphMetrics::new(&parsed.font_ref, Size::new(font_size), location_ref);
-        let mut advance = glyph_metrics.advance_width(GlyphId::new(key.index()))?;
-        // The advance is a horizontal vector; transform it like the outline.
-        advance *= (shape.scale_x as f64 * aspect) as f32;
-
-        let glyph_outline = parsed.outlines.get(GlyphId::new(key.index()))?;
-
-        // Hinting instances are cached per (instance, size, options), since
-        // the effective size depends on the transform scale and the options
-        // on the render mode.
-        let hinting_instance = match hinting_options(font_instance) {
-            Some((options, options_tag)) => self
-                .hinting_instance_cache
-                .entry((
-                    font_instance.base.instance_key,
-                    font_size.to_bits(),
-                    options_tag,
-                ))
-                .or_insert_with(|| {
-                    HintingInstance::new(
-                        &parsed.outlines,
-                        Size::new(font_size),
-                        location_ref,
-                        options,
-                    )
-                    .ok()
-                })
-                .as_ref(),
-            None => None,
-        };
-
-        let draw_settings = match hinting_instance {
-            Some(hinting_instance) => DrawSettings::hinted(hinting_instance, false),
-            None => DrawSettings::unhinted(Size::new(font_size), location_ref),
-        };
-
-        let mut outline_path = OutlinePath {
-            path: std::mem::take(&mut self.scratch_path),
-        };
-        outline_path.reuse();
-        if glyph_outline.draw(draw_settings, &mut outline_path).is_err() {
-            self.scratch_path = outline_path.path;
-            return None;
-        }
-        let mut path = outline_path.path;
-
-        if !identity_shape {
-            path.apply_affine(affine);
-        }
-
-        // Synthetic bold: fatten the outline like FreeType's
-        // mozilla_glyphslot_embolden_less (half of FT_GlyphSlot_Embolden's
-        // strength): the glyph grows by size/48 px in each axis, i.e. an
-        // expansion radius of size/96 px per side, and the advance grows by
-        // the same total amount.
-        if font_instance.flags.contains(FontInstanceFlags::SYNTHETIC_BOLD) {
-            let strength = req_size * y_scale / 48.0;
-            let radius = strength * 0.5;
-            path = expand_path(&path, Diagonal2::new(radius, radius), Join::Miter, 4.0, 0.1);
-            advance += strength as f32;
-        }
-
-        // Apply the subpixel offset to the path so that both the bounding box
-        // and the rasterisation account for it exactly.
-        let (dx, dy) = font_instance.get_subpx_offset(key);
-        if dx != 0.0 || dy != 0.0 {
-            path.apply_affine(Affine::translate((dx, dy)));
-        }
-
-        // The path is in y-down coordinates with the origin at the baseline.
-        // Round outward to device pixel boundaries.
-        let bounds = path.bounding_box();
-        let (min_x, max_x, min_y, max_y) = if bounds.is_zero_area() {
-            (0, 0, 0, 0)
+        let aspect = (x_scale / y_scale) as f32;
+        let transform = Transform::new(
+            shape.scale_x * aspect,
+            -shape.skew_y * aspect,
+            -shape.skew_x,
+            shape.scale_y,
+            tx as f32,
+            -ty as f32,
+        );
+        let bold = if instance.flags.contains(FontInstanceFlags::SYNTHETIC_BOLD) {
+            size / 48.0
         } else {
-            (
-                bounds.x0.floor() as i32,
-                bounds.x1.ceil() as i32,
-                bounds.y0.floor() as i32,
-                bounds.y1.ceil() as i32,
-            )
+            0.0
         };
-
-        let dimensions = GlyphDimensions {
-            advance,
-            left: min_x,
-            // Distance from the baseline up to the top of the glyph.
-            top: -min_y,
-            width: max_x - min_x,
-            height: max_y - min_y,
-        };
-
-        Some(LoadedGlyph {
-            path,
-            dimensions,
-        })
-    }
-
-    /// Load an embedded bitmap (sbix/CBDT/EBDT) for a glyph, if the font
-    /// provides one and the instance permits its use. Mirrors the FreeType
-    /// backend: monochrome (EBDT) strikes require the EMBEDDED_BITMAPS
-    /// flag, while color strikes are always used.
-    fn load_bitmap(
-        &mut self,
-        font_instance: &FontInstance,
-        key: &GlyphKey,
-    ) -> Option<LoadedBitmap> {
-        let parsed = self.font_cache.get(&font_instance.font_key)?.parsed();
-        match parsed.strikes.format()? {
-            BitmapFormat::Sbix | BitmapFormat::Cbdt => {}
-            BitmapFormat::Ebdt => {
-                if !font_instance.flags.contains(FontInstanceFlags::EMBEDDED_BITMAPS) {
-                    return None;
-                }
-            }
+        let advance = font
+            .glyph_metrics()
+            .scaled_f32(size)
+            .h_advance(GlyphId::new(key.index()))
+            * shape.scale_x
+            * aspect
+            + bold;
+        let mut scaler = self
+            .context
+            .builder(font, cached.key)
+            .size(size)
+            .hinting(hinting(instance))
+            .build();
+        let mut sources = [
+            Source::ColorBitmap(StrikeWith::BestFit),
+            Source::ColorOutline(0),
+            Source::Outline,
+            Source::Outline,
+        ];
+        if instance.flags.contains(FontInstanceFlags::EMBEDDED_BITMAPS) {
+            sources[2] = Source::Bitmap(StrikeWith::BestFit);
         }
-
-        let req_size = font_instance.size.to_f64_px();
-        let (_, y_scale) = font_instance
-            .transform
-            .compute_scale()
-            .unwrap_or((1.0, 1.0));
-        let glyph_id = GlyphId::new(key.index());
-        let bitmap = parsed
-            .strikes
-            .glyph_for_size(Size::new((req_size * y_scale) as f32), glyph_id)?;
-
-        // Zero-sized bitmaps (e.g. spaces) are kept so their metrics
-        // (notably the advance) are still reported, matching FreeType;
-        // rasterization rejects them below.
-        let width = bitmap.width as i32;
-        let height = bitmap.height as i32;
-
-        let ppem = bitmap.ppem_y;
-        let scale = req_size as f32 / ppem;
-        let units_to_px = ppem / parsed.units_per_em;
-
-        let left = (bitmap.bearing_x * units_to_px + bitmap.inner_bearing_x).round() as i32;
-        let top = match bitmap.placement_origin {
-            Origin::TopLeft => bitmap.inner_bearing_y.round() as i32,
-            Origin::BottomLeft => {
-                (bitmap.bearing_y * units_to_px + bitmap.inner_bearing_y).round() as i32 + height
+        let (dx, dy) = instance.get_subpx_offset(key);
+        let format = if instance.render_mode == FontRenderMode::Subpixel {
+            if instance.flags.contains(FontInstanceFlags::SUBPIXEL_BGR) {
+                Format::Subpixel
+            } else {
+                Format::subpixel_bgra()
             }
+        } else {
+            Format::Alpha
         };
-
-        let advance = match bitmap.advance {
-            Some(advance) => advance * scale,
-            None => {
-                let location =
-                    Self::instance_location(&mut self.location_cache, parsed, font_instance);
-                GlyphMetrics::new(
-                    &parsed.font_ref,
-                    Size::new((req_size * y_scale) as f32),
-                    LocationRef::from(location),
-                )
-                .advance_width(glyph_id)
-                .unwrap_or(0.0)
-            }
-        };
-
-        let num_pixels = width as usize * height as usize;
-        let (buffer, format) = match &bitmap.data {
-            BitmapData::Bgra(bytes) => {
-                // Already premultiplied BGRA8.
-                if bytes.len() < num_pixels * 4 {
-                    return None;
-                }
-                (bytes[.. num_pixels * 4].to_vec(), GlyphFormat::ColorBitmap)
-            }
-            BitmapData::Png(bytes) => {
-                let mut decoder = png::Decoder::new(std::io::Cursor::new(*bytes));
-                decoder.set_transformations(
-                    png::Transformations::ALPHA |
-                        png::Transformations::EXPAND |
-                        png::Transformations::STRIP_16,
-                );
-                let mut reader = decoder.read_info().ok()?;
-                let mut rgba = vec![0u8; reader.output_buffer_size()?];
-                let info = reader.next_frame(&mut rgba).ok()?;
-                if info.width as i32 != width ||
-                    info.height as i32 != height ||
-                    info.color_type != png::ColorType::Rgba
-                {
-                    return None;
-                }
-                // Convert RGBA to premultiplied BGRA.
-                let mut buffer = vec![0u8; num_pixels * 4];
-                for (src, dst) in rgba.chunks_exact(4).zip(buffer.chunks_exact_mut(4)) {
-                    let a = src[3] as u32;
-                    dst[0] = ((src[2] as u32 * a + 128) / 255) as u8;
-                    dst[1] = ((src[1] as u32 * a + 128) / 255) as u8;
-                    dst[2] = ((src[0] as u32 * a + 128) / 255) as u8;
-                    dst[3] = a as u8;
-                }
-                (buffer, GlyphFormat::ColorBitmap)
-            }
-            BitmapData::Mask(mask) => {
-                let alpha = mask.decode(bitmap.width, bitmap.height).ok()?;
-                let mut buffer = vec![0u8; num_pixels * 4];
-                for (a, dst) in alpha.iter().zip(buffer.chunks_exact_mut(4)) {
-                    dst.fill(*a);
-                }
-                (buffer, GlyphFormat::Bitmap)
-            }
-        };
-
-        Some(LoadedBitmap {
-            buffer,
-            width,
-            height,
-            left,
-            top,
-            scale,
-            advance,
-            format,
-        })
+        let rendered = Render::new(&sources)
+            .format(format)
+            .transform(Some(transform))
+            .offset(Vector::new(dx as f32, -dy as f32))
+            .embolden(bold)
+            .default_color([255, 255, 255, 255])
+            .render_into(&mut scaler, key.index(), &mut self.image);
+        if rendered {
+            Some(advance)
+        } else {
+            None
+        }
     }
-
     pub fn get_glyph_dimensions(
         &mut self,
-        font_instance: &FontInstance,
+        instance: &FontInstance,
         key: &GlyphKey,
     ) -> Option<GlyphDimensions> {
-        if let Some(bitmap) = self.load_bitmap(font_instance, key) {
-            // Report dimensions scaled to the requested size, rounded
-            // outward, matching the FreeType backend.
-            let scale = bitmap.scale;
-            let x0 = bitmap.left as f32 * scale;
-            let x1 = bitmap.width as f32 * scale + x0;
-            let y1 = bitmap.top as f32 * scale;
-            let y0 = y1 - bitmap.height as f32 * scale;
-            return Some(GlyphDimensions {
-                left: x0.round() as i32,
-                top: y1.round() as i32,
-                width: (x1.ceil() - x0.floor()) as i32,
-                height: (y1.ceil() - y0.floor()) as i32,
-                advance: bitmap.advance,
-            });
-        }
-        let glyph = self.load_glyph(font_instance, key)?;
-        let dimensions = glyph.dimensions;
-        self.scratch_path = glyph.path;
-        Some(dimensions)
+        let advance = self.render(instance, key)?;
+        let image = &self.image;
+        Some(GlyphDimensions {
+            left: image.placement.left,
+            top: image.placement.top,
+            width: image.placement.width as i32,
+            height: image.placement.height as i32,
+            advance,
+        })
     }
     pub fn rasterize_glyph(
         &mut self,
-        font_instance: &FontInstance,
+        instance: &FontInstance,
         key: &GlyphKey,
     ) -> GlyphRasterResult {
-        if let Some(bitmap) = self.load_bitmap(font_instance, key) {
-            // Handle zero-sized bitmap glyphs (e.g. space chars)
-            if bitmap.width == 0 || bitmap.height == 0 {
-                return Err(GlyphRasterError::LoadFailed);
-            }
-            return self.rasterize_bitmap(font_instance, bitmap);
-        }
-        let glyph = self
-            .load_glyph(font_instance, key)
+        self.render(instance, key)
             .ok_or(GlyphRasterError::LoadFailed)?;
-        let dimensions = glyph.dimensions;
-
-        // Handle zero-sized glyphs (e.g. space chars)
-        if dimensions.width == 0 || dimensions.height == 0 {
-            self.scratch_path = glyph.path;
+        let image = &self.image;
+        let p = image.placement;
+        if p.width == 0 || p.height == 0 {
             return Err(GlyphRasterError::LoadFailed);
         }
-
-        // When the glyph will be sampled with scaling (local raster space),
-        // surround it with a transparent 1px border to avoid bleeding
-        // neighbouring atlas texels.
-        let padding = if font_instance.use_texture_padding() { 1 } else { 0 };
-        let width = dimensions.width as u16 + 2 * padding;
-        let height = dimensions.height as u16 + 2 * padding;
-
-        let render_context = &mut self.render_context;
-        render_context.reset_and_resize(width, height);
-
-        // Render white coverage; the actual text color is applied by
-        // WebRender's shaders when compositing the glyph from the atlas.
-        render_context.set_paint(PaintType::Solid(peniko::Color::WHITE));
-
-        // Position the path so that its bounding box lands exactly on the
-        // pixmap: translate by (-left, top), i.e. by (-min_x, -min_y),
-        // plus the padding border.
-        render_context.set_transform(Affine::translate((
-            (padding as i32 - dimensions.left) as f64,
-            (padding as i32 + dimensions.top) as f64,
-        )));
-        render_context.fill_path(&glyph.path);
-        render_context.flush();
-
-        let mut buffer = vec![0; width as usize * height as usize * 4];
-        render_context.render(
-            PixmapMut::new(width, height, &mut buffer).unwrap(),
-            &mut self.resources,
-        );
-
-        self.scratch_path = glyph.path;
-
+        let padding = if instance.use_texture_padding() { 1 } else { 0 };
+        let width = p.width as usize + 2 * padding;
+        let height = p.height as usize + 2 * padding;
+        let mut bytes = vec![0; width * height * 4];
+        for y in 0..p.height as usize {
+            for x in 0..p.width as usize {
+                let i = y * p.width as usize + x;
+                let dst = &mut bytes[((y + padding) * width + x + padding) * 4..][..4];
+                match image.content {
+                    Content::Mask => dst.fill(image.data[i]),
+                    Content::SubpixelMask => {
+                        dst.copy_from_slice(&image.data[i * 4..][..4]);
+                        dst[3] = dst[0].max(dst[1]).max(dst[2]);
+                    }
+                    Content::Color => {
+                        let src = &image.data[i * 4..][..4];
+                        let a = src[3] as u32;
+                        dst.copy_from_slice(&[
+                            ((src[2] as u32 * a + 128) / 255) as u8,
+                            ((src[1] as u32 * a + 128) / 255) as u8,
+                            ((src[0] as u32 * a + 128) / 255) as u8,
+                            src[3],
+                        ]);
+                    }
+                }
+            }
+        }
+        let bitmap = matches!(image.source, Source::Bitmap(_) | Source::ColorBitmap(_));
+        let format = match image.content {
+            Content::Color => GlyphFormat::ColorBitmap,
+            Content::SubpixelMask => GlyphFormat::Subpixel,
+            Content::Mask if bitmap => GlyphFormat::Bitmap,
+            Content::Mask => GlyphFormat::Alpha,
+        };
         Ok(RasterizedGlyph {
-            top: (dimensions.top + padding as i32) as f32,
-            left: (dimensions.left - padding as i32) as f32,
+            left: (p.left - padding as i32) as f32,
+            top: (p.top + padding as i32) as f32,
             width: width as i32,
             height: height as i32,
-            // The transform (including scale) is fully baked into the
-            // rasterized outline.
             scale: 1.0,
-            format: GlyphFormat::Alpha,
-            bytes: buffer,
+            format,
+            bytes,
             is_packed_glyph: false,
         })
     }
+}
 
-    /// Package a decoded embedded bitmap as a rasterized glyph at the
-    /// strike's native resolution; WebRender scales it at composite time
-    /// via the reported `scale`.
-    fn rasterize_bitmap(
-        &mut self,
-        font_instance: &FontInstance,
-        bitmap: LoadedBitmap,
-    ) -> GlyphRasterResult {
-        let LoadedBitmap {
-            buffer,
-            width,
-            height,
-            mut left,
-            mut top,
-            scale,
-            advance: _,
-            format,
-        } = bitmap;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::BaseFontInstance;
+    use api::{units::DevicePoint, FontInstanceOptions, IdNamespace};
 
-        let (buffer, width, height) = if font_instance.use_texture_padding() {
-            let padded_width = width + 2;
-            let padded_height = height + 2;
-            let mut padded = vec![0u8; padded_width as usize * padded_height as usize * 4];
-            let src_stride = width as usize * 4;
-            let dst_stride = padded_width as usize * 4;
-            for (row, src) in buffer.chunks_exact(src_stride).enumerate() {
-                let dst = (row + 1) * dst_stride + 4;
-                padded[dst .. dst + src_stride].copy_from_slice(src);
-            }
-            left -= 1;
-            top += 1;
-            (padded, padded_width, padded_height)
-        } else {
-            (buffer, width, height)
-        };
+    fn setup() -> (FontContext, FontInstance) {
+        let ns = IdNamespace(0);
+        let key = FontKey::new(ns, 0);
+        let mut context = FontContext::new();
+        context.add_raw_font(
+            &key,
+            Arc::new(include_bytes!("../../../../wrench/reftests/text/FreeSans.ttf").to_vec()),
+            0,
+        );
+        let base = BaseFontInstance::new(
+            FontInstanceKey::new(ns, 0),
+            key,
+            24.0,
+            Some(FontInstanceOptions {
+                render_mode: FontRenderMode::Alpha,
+                ..Default::default()
+            }),
+            None,
+            Vec::new(),
+        );
+        let mut instance = FontInstance::from_base(Arc::new(base));
+        FontContext::prepare_font(&mut instance);
+        (context, instance)
+    }
 
-        Ok(RasterizedGlyph {
-            top: top as f32,
-            left: left as f32,
-            width,
-            height,
-            scale,
-            format,
-            bytes: buffer,
-            is_packed_glyph: false,
-        })
+    fn glyph(index: u32) -> GlyphKey {
+        GlyphKey::new(index, DevicePoint::zero(), crate::SubpixelDirection::None)
+    }
+
+    #[test]
+    fn renders_and_reuses_font_state() {
+        let (mut context, instance) = setup();
+        let index = context.get_glyph_index(instance.font_key, 'A').unwrap();
+        let key = glyph(index);
+        let dimensions = context.get_glyph_dimensions(&instance, &key).unwrap();
+        let first = context.rasterize_glyph(&instance, &key).unwrap();
+        let second = context.rasterize_glyph(&instance, &key).unwrap();
+        assert!(dimensions.advance > 0.0);
+        assert!(first.width > 0 && first.height > 0);
+        assert!(first.bytes.iter().any(|b| *b != 0));
+        assert_eq!(first.bytes, second.bytes);
+        assert_eq!(context.location_cache.len(), 1);
+        context.delete_font_instance(&instance);
+        assert!(context.location_cache.is_empty());
+        context.rasterize_glyph(&instance, &key).unwrap();
+        context.delete_font(&instance.font_key);
+        assert!(context.font_cache.is_empty());
+        assert!(context.location_cache.is_empty());
+        assert!(context.rasterize_glyph(&instance, &key).is_err());
+    }
+
+    #[test]
+    fn embedded_bitmap_best_fit() {
+        let (mut context, mut instance) = setup();
+        context.add_raw_font(
+            &instance.font_key,
+            Arc::new(include_bytes!("../../../../wrench/reftests/text/Proggy.ttf").to_vec()),
+            0,
+        );
+        instance.flags.insert(FontInstanceFlags::EMBEDDED_BITMAPS);
+        let index = context.get_glyph_index(instance.font_key, 'A').unwrap();
+        let result = context.rasterize_glyph(&instance, &glyph(index)).unwrap();
+        assert!(matches!(result.format, GlyphFormat::Bitmap));
+        assert!(result.width > 0 && result.height > 0);
+        assert!(result.bytes.iter().any(|b| *b != 0));
+    }
+
+    #[test]
+    fn subpixel_coverage_and_padding() {
+        let (mut context, mut instance) = setup();
+        instance.render_mode = FontRenderMode::Subpixel;
+        let index = context.get_glyph_index(instance.font_key, 'A').unwrap();
+        let key = glyph(index);
+        let unpadded = context.rasterize_glyph(&instance, &key).unwrap();
+        assert!(matches!(unpadded.format, GlyphFormat::Subpixel));
+        assert!(unpadded.bytes.chunks_exact(4).any(|p| p[0] != p[2]));
+        assert!(unpadded
+            .bytes
+            .chunks_exact(4)
+            .all(|p| p[3] == p[0].max(p[1]).max(p[2])));
+        instance.flags.insert(FontInstanceFlags::TEXTURE_PADDING);
+        let padded = context.rasterize_glyph(&instance, &key).unwrap();
+        assert_eq!(padded.width, unpadded.width + 2);
+        assert_eq!(padded.height, unpadded.height + 2);
+        assert_eq!(padded.left, unpadded.left - 1.0);
+        assert_eq!(padded.top, unpadded.top + 1.0);
+        assert!(padded.bytes[..padded.width as usize * 4]
+            .iter()
+            .all(|b| *b == 0));
+    }
+
+    #[test]
+    fn empty_and_invalid_glyphs() {
+        let (mut context, instance) = setup();
+        let index = context.get_glyph_index(instance.font_key, ' ').unwrap();
+        let dimensions = context
+            .get_glyph_dimensions(&instance, &glyph(index))
+            .unwrap();
+        assert!(dimensions.advance > 0.0);
+        assert!(context.rasterize_glyph(&instance, &glyph(index)).is_err());
+        assert!(context.rasterize_glyph(&instance, &glyph(0xffff)).is_err());
+        context.delete_font(&instance.font_key);
+        context.add_raw_font(&instance.font_key, Arc::new(vec![0; 4]), 0);
+        assert!(context.get_glyph_index(instance.font_key, 'A').is_none());
     }
 }
 
@@ -827,8 +443,8 @@ impl FontContext {
 /// This functions maps from postscript name to index
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 fn ttc_index_from_postscript_name(font_file: FileRef<'_>, postscript_name: &str) -> u32 {
-    use skrifa::raw::{FileRef, TableProvider as _};
     use skrifa::raw::types::NameId;
+    use skrifa::raw::{FileRef, TableProvider as _};
 
     let index = match font_file {
         FileRef::Font(_) => 0,
