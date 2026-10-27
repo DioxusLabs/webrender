@@ -9,7 +9,7 @@ from `wrench/`.
 
 Each worker's `FontContext` owns one persistent glyphrast `RasterContext`
 (including its bounded scaler cache and rasterization scratch storage), plus
-one reusable `Image`. Registered fonts own a glyphrast/read-fonts `Font`, which
+one reusable `Image` and an outline buffer for dimension queries. Registered fonts own a glyphrast/read-fonts `Font`, which
 shares its byte storage and lazily cached parsed tables; WebRender no longer
 needs its own unsafe yoke adapter. Native fonts keep memory-mapped storage.
 
@@ -59,9 +59,22 @@ These are intentionally not compensated for in WebRender:
   upstream alpha contract is needed; this is source-inspected, not covered
   by the text reftests' non-color font fixtures.
 
-Dimension queries currently render into the reusable image to obtain exactly
-the same placement as rasterization, including color and bitmap glyphs.
-This costs more than the old backend's outline-only metrics path.
+* **Bitmap/color bounds require rendering.** `Scaler::scale_outline_into` and
+  zeno's public bounds API provide exact plain-outline placement without coverage
+  generation. There is no corresponding glyphrast bitmap strike/placement query:
+  `strike::Bitmap`, `Strikes` and `Scaler::scale_bitmap_impl` are private;
+  the public `scale_bitmap_into` decodes/resizes pixels. Color rendering also has
+  no placement-only API covering COLRv0/v1 and their source fallback rules.
+  Queries for fonts with these sources therefore retain rendering rather than
+  duplicating glyphrast's strike selection, color painting or failure semantics.
+
+Plain-outline dimension queries now scale into a reusable outline, apply the
+same embolden, transform and signed subpixel offset as Render, and use zeno's
+path bounds with floor(min)/ceil(max), exactly as `Mask::placement` does.
+No coverage buffer is generated. Tests compare placements against rendering
+for Latin-1, empty glyphs, bold, italics, rotation, skew, reflection, horizontal
+and vertical quarter-pixel positions, and alpha/LCD; invalid IDs return None.
+Bitmap queries test the retained rendering fallback.
 
 ## Validation (Linux, software rendering)
 
@@ -76,12 +89,12 @@ For `wrench --headless --software reftest reftests/text`:
 | FreeType | 48 | 0 |
 | original vello_cpu fontations | 46 | 2 |
 
-Glyphrast's failure is `snap-clip.yaml == snap-clip-ref.yaml`: one pixel,
+The initial glyphrast failure was `snap-clip.yaml == snap-clip-ref.yaml`: one pixel,
 maximum channel difference 3. Original fontations also fails this comparison
 (one pixel, maximum difference 2), and additionally fails
 `allow-subpixel.yaml != allow-subpixel-ref.yaml`. No tolerance or rasterization
-workaround was added. The clipping difference's underlying cause has not been
-isolated to glyphrast.
+workaround was added. The cause is now isolated below; follow-up counts include
+one additional failure after correcting LCD channel order.
 
 ### Benchmarks
 
@@ -125,3 +138,161 @@ nonempty results per size; mean milliseconds:
 These are single-machine measurements, not statistically controlled claims
 about renderer performance. The benchmark's FreeType path has different
 threading behavior from fontations.
+
+## Follow-up: bounds, profiling and LCD correctness
+
+### Changes
+
+* Dimension queries avoid rendering for plain outlines; rasterization no longer
+  computes the unused horizontal advance.
+* Atlas conversion dispatches on content once per row, rather than per pixel.
+  Alpha expansion uses bounded source/destination slices and chunked writes;
+  LCD rows are copied once and their alpha is filled separately. The owned
+  atlas allocation and glyphrast's reusable image are still necessary.
+* Corrected the LCD format mapping: default uses `Format::Subpixel`;
+  `SUBPIXEL_BGR` uses `Format::subpixel_bgra()`. Zeno's offsets translate
+  the *path*, rather than specifying sample locations. Despite the helper name,
+  the former produces the FreeType-compatible BGRA coverage order for ordinary
+  RGB panels. A FreeSans glyph-50 probe at 26.6667px gave right-edge BGRA
+  `[0,3,86,86]` in FreeType, `[78,3,0,78]` before this correction, and
+  `[0,3,78,78]` afterward. Coverage magnitudes need not match the different
+  LCD filters. Tests check right-edge channel orientation and exact BGR reversal.
+* Subpixel signs were already correct: both backends add positive x and
+  *negative* y to a y-up outline (`unix/font.rs::rasterize_glyph_outline`).
+  Quarter-pixel GlyphKey offsets are exactly representable in FreeType's 26.6
+  conversion; glyphrast receives the same offsets without a sign change.
+
+### snap-clip: missing mono, not placement rounding
+
+The manifest uses `options(disable-aa)`; manifest parsing maps this
+to `FontRenderMode::Mono`. YAML's size 20 is points
+(`YamlHelper::as_pt_to_f32`), i.e. 26.6667px. The backend disables subpixel
+positioning for Mono but glyphrast has neither a mono format nor a mono hint
+target, so `Render::render_into` uses `Format::Alpha` with normal hinting.
+
+Decoded failure images differ only at (30,20): clipped white (255) versus
+reference gray (252). A direct glyphrast-only reproduction with FreeSans
+glyph 50 has outline max-x 20.03125, placement left=1,width=20, and coverage
+3 at local (20,10). The glyph's origin is (10,30), placing this sample at
+(30,20), outside the snapped right clip edge 30. The unclipped reference
+therefore retains it. The adapter returns exactly [3,3,3,3] for this pixel.
+FreeType Mono instead has left=1,width=19, excluding that pixel.
+**Disproof of a placement-only cause:** requesting Alpha from FreeType also
+produces [3,3,3,3] there, with the same left=1,width=20 placement.
+This is the existing mono capability gap (`zeno::Format`,
+`glyphrast::RasterTarget`, `Render::render_into`), not a rounding fix to
+make in WebRender. No thresholding or clipping workaround was added.
+
+### Profiles
+
+Hardware `perf` is unavailable here (`perf_event_paranoid=4`); Callgrind
+was used instead. These are **retired instruction counts, not sampled CPU
+time**. A copy of glyph_bench capped at 20 timed iterations (plus its 10
+warmups), otherwise unchanged, used BENCH_FILTER for each scenario. Font
+parsing/startup is included. Symbols below are demangled for readability.
+Reproduce the profile shape with, for example:
+
+```sh
+BENCH_FILTER=alpha_48px valgrind --tool=callgrind target/release/examples/glyph_bench
+callgrind_annotate --auto=no callgrind.out.*
+```
+
+| Scenario | Before total instructions | After | Before adapter rasterize self | After adapter rasterize self |
+| --- | ---: | ---: | ---: | ---: |
+| Alpha 48px | 400519832 | 311899009 | 114057150 | 26080131 |
+| Italics 16px | 160379917 | 148493838 | 18335880 | 7076481 |
+| Proggy 8.25px | 59430933 | 57775368 | 3738180 | 2726460 |
+
+This isolates a real WebRender-side conversion cost even when wall-clock
+measurements are noisy. No added per-glyph font parse or cache rebuild was
+found; scaler construction still looks up the persistent per-worker cache.
+
+Remaining performance gaps / upstream hotspots:
+
+* **Outline coverage cost:** `Render::render_into` dispatches the outline
+  branch to zeno. After the adapter optimization, Alpha 48px spends 45.43%
+  of instructions in `zeno::Rasterizer::line_to`, 16.87% in
+  `Rasterizer::rasterize` and 4.39% in `quad_to`.
+  Italics spends 42.05%, 11.30% and 5.99%, respectively.
+  Before conversion optimization, rotation and skew already spent
+  41.19%/38.65% in line_to, 10.54%/10.49% in rasterize and
+  5.23%/5.60% in quad_to. Both backends disable hinting for these transforms,
+  so this is not an accidental hinted-vs-unhinted comparison.
+  FreeType's corresponding profiles instead lead with `gray_conic_to`
+  (18–19% for the transforms); its complete instruction totals were
+  145777624 (italics), 155524177 (rotation), 144915216 (skew), versus
+  glyphrast's original 160379917/175597842/158917797.
+  These are library coverage costs, not evidence of a specific algorithmic bug;
+  instruction fractions do not establish their wall-clock contribution.
+* **Bitmap resampling:** `Scaler::scale_bitmap_impl` reaches
+  `bitmap::resize(Filter::Mitchell)` whenever requested size differs from
+  strike ppem. Proggy 8.25px takes that branch. After optimization,
+  `glyphrast::bitmap::resize` accounts for 34988970 instructions (60.56%),
+  and `strike::Bitmap::decode` for 4461930 (7.72%).
+  FreeType's bitmap profile totals only 20174440 instructions, with
+  `tt_sbit_decoder_load_bit_aligned` and `tt_sbit_decoder_load_image`
+  its leading library functions and no Mitchell resize. Glyphrast's public
+  bitmap API offers no metadata-only or decoded-strike reuse hook to eliminate
+  that work in the adapter. No nearest-neighbor/strike-selection workaround
+  was substituted. Success counts still differ because of the existing
+  scaled-dimension truncation gap.
+
+### Follow-up verification and timings
+
+Linux software text suite: **glyphrast 46 passing, 2 failing; FreeType 48
+passing, 0 failing**. Library tests: **9 passed, 0 failed**. Fontations
+cargo check and both software Wrench builds completed.
+
+Failures:
+
+* `snap-clip`: unchanged, max difference 3 at one pixel, explained above.
+* **New failure after the LCD-order correction:** `split-batch`, max
+  difference 2 across 1514 pixels; the existing software tolerance allows
+  1510. An isolated run also reproduces 1514. Its two YAML files are
+  byte-identical; the discrepancy is between successive scene renders,
+  not a direct FreeType image comparison. Whether atlas coordinates or other
+  renderer state explains the difference remains unverified.
+  The specific renderer/coverage interaction is **not isolated**, and is not
+  being claimed as a confirmed glyphrast bug. The correct LCD mapping is kept;
+  no fuzzy tolerance, shader or raster workaround was added.
+
+Mean ns/glyph, 200 iterations per scenario, sequential runs after builds and
+profiling completed. Before columns are the initial recorded runs; current
+FreeType was remeasured. Scheduling noise is substantial (notably current skew:
+4785 mean versus 2645 best iteration). These are observations, not controlled
+speedup claims; instruction profiles provide the stronger conversion evidence.
+
+| Scenario | glyphrast before | glyphrast after | FreeType now |
+| --- | ---: | ---: | ---: |
+| Alpha 10px | 2152 | 2521 | 3844 |
+| Alpha 16px | 2733 | 3234 | 3353 |
+| Alpha 24px | 3702 | 3957 | 4001 |
+| Alpha 48px | 6183 | 5704 | 5941 |
+| Subpixel positions 16px | 2870 | 3100 | 3801 |
+| Bold | 3348 | 3348 | 5937 |
+| Italics | 2973 | 2891 | 3019 |
+| Rotation | 3246 | 3414 | 2826 |
+| Skew | 3249 | 4785 | 2494 |
+| Mono | 2979 | 2924 | 5011 |
+| Subpixel AA | 6672 | 6550 | 6612 |
+| Proggy bitmap | 706 | 571 | 171 |
+| Dimensions 16px | 2725 | 563 | 1523 |
+| Fresh context | 3197 | 3847 | 3531 |
+
+The previous vello_cpu dimension measurement was 769 ns. Bitmap and Mono
+remain unequal-work comparisons, as described above; no optional CJK or color
+fixtures were added. Vello_cpu was not rebuilt for this follow-up.
+
+Four-worker glyph_bench_mt, five repeats, mean milliseconds:
+
+| Size | glyphrast before | glyphrast after | FreeType now |
+| --- | ---: | ---: | ---: |
+| 10px | 2.26 | 3.06 | 18.09 |
+| 16px | 2.70 | 4.00 | 19.24 |
+| 24px | 3.74 | 4.27 | 24.18 |
+| 48px | 7.31 | 9.22 | 34.51 |
+
+These whole-pipeline runs include worker scheduling and are noisier than the
+single-thread microbenchmarks. Raw follow-up logs, probes and Callgrind
+profiles from this machine are retained in /home/ubuntu/glyphrast-results/.
+Cross-platform builds and color-font visual checks remain unverified.
