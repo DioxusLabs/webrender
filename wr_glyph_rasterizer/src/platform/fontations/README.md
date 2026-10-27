@@ -94,7 +94,8 @@ maximum channel difference 3. Original fontations also fails this comparison
 (one pixel, maximum difference 2), and additionally fails
 `allow-subpixel.yaml != allow-subpixel-ref.yaml`. No tolerance or rasterization
 workaround was added. The cause is now isolated below; follow-up counts include
-one additional failure after correcting LCD channel order.
+one additional failure observed in the same round as the LCD correction.
+The direct comparison below rules out LCD order as its cause.
 
 ### Benchmarks
 
@@ -246,7 +247,7 @@ cargo check and both software Wrench builds completed.
 Failures:
 
 * `snap-clip`: unchanged, max difference 3 at one pixel, explained above.
-* **New failure after the LCD-order correction:** `split-batch`, max
+* **Additional failure observed alongside the LCD-order correction:** `split-batch`, max
   difference 2 across 1514 pixels; the existing software tolerance allows
   1510. An isolated run also reproduces 1514. Its two YAML files are
   byte-identical; the discrepancy is between successive scene renders,
@@ -255,6 +256,83 @@ Failures:
   The specific renderer/coverage interaction is **not isolated**, and is not
   being claimed as a confirmed glyphrast bug. The correct LCD mapping is kept;
   no fuzzy tolerance, shader or raster workaround was added.
+
+### Direct FreeType LCD comparison and split-batch investigation
+
+An external probe used `platform::font::FontContext::{add_raw_font,
+prepare_font,rasterize_glyph}` in separate FreeType and fontations builds.
+It used identical font bytes, instance options, sizes and `GlyphKey`s:
+FreeSans glyphs 36/50 and VeraBd glyphs 55/45, at 16, 26.6667 and 666.6667
+device pixels; zero offset, horizontal quarter-pixel and vertical half-pixel
+offsets; `FontRenderMode::Subpixel`; and both values of `SUBPIXEL_BGR`.
+That is 72 renders per backend, 144 total. Buffers were aligned by their
+returned left/top placement before comparing BGRA channels.
+
+Both backends reverse R/B exactly when `SUBPIXEL_BGR` changes. All 72
+cross-backend comparisons favor the current mapping over its opposite:
+aggregate absolute RGB byte error is 605,848 versus 11,675,964. For example,
+FreeSans glyph 50 at 26.6667px, zero offset, world pixel (20,10) in y-up
+coordinates returns:
+
+| Backend | BGR off, BGRA bytes | BGR on, BGRA bytes |
+| --- | --- | --- |
+| FreeType | `[0,3,86,86]` | `[86,3,0,86]` |
+| glyphrast | `[0,3,78,78]` | `[78,3,0,78]` |
+
+The correct mapping remains default -> `Format::Subpixel`, BGR ->
+`Format::subpixel_bgra()`. Different coverage magnitudes are not channel-order
+errors. Probe source, logs and raw buffers are retained in
+`/home/ubuntu/glyphrast-results/lcd.rs`, `lcd-{freetype,glyphrast}.log` and
+`lcd-comparison/` on the investigation machine.
+
+`split-batch` does **not** exercise this mapping. Runtime rasterizer traces
+show VeraBd glyphs 55/45 at 320px, `Alpha`, `TEXTURE_PADDING`, zero offset,
+and `GlyphFormat::Alpha`. `TextRunPrimitive::update_font_instance` limits the
+oversized 500pt text to `FONT_SIZE_LIMIT` and disables subpixel AA. The
+`render_mode == Subpixel` branch selecting the LCD format is not reached.
+
+Both current and previous LCD mappings can pass the isolated test. Crucially,
+the previous mapping also fails with exactly the original 1,514 differing
+pixels (maximum difference 2) when font cleanup is flushed before the reference
+scene. Thus restoring the previous mapping is not a fix.
+
+The differing runs track an asynchronous font-lifetime distinction in the
+harness: `render_yaml` calls `YamlFrameReader::deinit`, which sends font
+deletions without waiting. `ApiResources::update` deduplicates new fonts,
+whereas `ResourceCache::update_resources` processes deletions after scene swap.
+In passing traced runs the reference reused the shared font/glyph cache and
+the images were identical. In failing runs it registered a new shared font;
+the glyph atlas rectangles moved:
+
+| Glyph | Test atlas rect | Reference atlas rect |
+| --- | --- | --- |
+| 45 | `(0,0)-(110,299)` | `(332,0)-(442,299)` |
+| 55 | `(112,0)-(330,235)` | `(444,0)-(662,235)` |
+
+The test/reference rasterized buffers were byte-identical for each glyph:
+SHA-256 `86b99218b0d8fe079fca03ed4481aa3418d23aaec516ab2d3ee0cc2dd8c2c522`
+for 45 and `f5231ddd2b488a0b5c41e7728cab9f1fabed5f065fa86c27fe8262ce86bf0830`
+for 55. The failing rendered images also matched the original failure
+byte-for-byte. Evidence is in `split-current-image-trace.log`,
+`split-localuv.log` and `split-old-trace/` in the results directory.
+
+This localizes the discrepancy downstream of glyph rasterization, with atlas
+relocation/render-cache lifetime implicated, not a glyphrast coverage or LCD
+bug. The exact renderer sampling operation responsible remains unresolved.
+SWGL quantizes linear sampling to 1/128 texel (`LINEAR_QUANTIZE_UV`), but that
+alone does not establish the complete causal chain. An origin-relative UV
+interpolation experiment worsened the difference and was removed. All trace
+hooks, cleanup barriers and shader experiments were removed; no tolerance
+change or workaround is retained. A renderer fix is still outstanding, and
+this is not added to the glyphrast gap list.
+
+The final clean, uninstrumented software text run reported **47 passing,
+1 failing** (`snap-clip`, one pixel, maximum difference 3). `split-batch`
+passed in that run; this is not evidence of a fix, given the cache-lifetime
+sensitivity above. Build and reftest logs are `lcd-final-wrench-build.log`
+and `lcd-final-text-reftests.log` in the results directory.
+
+### Follow-up benchmark numbers
 
 Mean ns/glyph, 200 iterations per scenario, sequential runs after builds and
 profiling completed. Before columns are the initial recorded runs; current
