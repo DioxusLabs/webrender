@@ -62,6 +62,12 @@ struct SimpleFontHandle {
     pub data: Mmap,
 }
 
+fn color_to_bgra(src: &[u8], dst: &mut [u8]) {
+    for (dst, src) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+        dst.copy_from_slice(&[src[2], src[1], src[0], src[3]]);
+    }
+}
+
 impl From<NativeFontHandle> for SimpleFontHandle {
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     fn from(native: NativeFontHandle) -> Self {
@@ -337,15 +343,7 @@ impl FontContext {
                 }
                 Content::Color => {
                     let src = &image.data[src_start * 4..(src_start + p.width as usize) * 4];
-                    for (dst, src) in row.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
-                        let a = src[3] as u32;
-                        dst.copy_from_slice(&[
-                            ((src[2] as u32 * a + 128) / 255) as u8,
-                            ((src[1] as u32 * a + 128) / 255) as u8,
-                            ((src[0] as u32 * a + 128) / 255) as u8,
-                            src[3],
-                        ]);
-                    }
+                    color_to_bgra(src, row);
                 }
             }
         }
@@ -374,6 +372,15 @@ mod tests {
     use super::*;
     use crate::{BaseFontInstance, FontTransform, SubpixelDirection};
     use api::{units::DevicePoint, FontInstanceOptions, IdNamespace};
+
+    #[test]
+    fn color_conversion_preserves_premultiplied_channels() {
+        let src = [32, 64, 96, 128, 0, 1, 0, 1, 12, 34, 56, 255, 0, 0, 0, 0];
+        let mut dst = [0; 16];
+        color_to_bgra(&src, &mut dst);
+        assert_eq!(dst, [96, 64, 32, 128, 0, 1, 0, 1, 56, 34, 12, 255, 0, 0, 0, 0]);
+        color_to_bgra(&[], &mut []);
+    }
 
     fn setup() -> (FontContext, FontInstance) {
         let ns = IdNamespace(0);

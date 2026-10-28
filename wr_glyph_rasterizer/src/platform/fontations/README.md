@@ -60,14 +60,14 @@ These are intentionally not compensated for in WebRender:
   transformed outlines.
 * **Color emboldening:** `Render::embolden` is applied only in the plain
   outline branch, not COLRv0/v1. Synthetic bold color outlines are unchanged.
-* **Color alpha contract:** `Content::Color` has no straight/premultiplied
-  distinction. Its documentation describes straight alpha for PNG/COLRv0,
-  while the COLRv1 painter and COLRv0 blitter produce premultiplied pixels;
-  CBDT bytes are passed through. The adapter follows the straight-RGBA
-  contract when producing WebRender's premultiplied BGRA, so already
-  premultiplied sources with translucent pixels can be darkened. A consistent
-  upstream alpha contract is needed; this is source-inspected, not covered
-  by the text reftests' non-color font fixtures.
+* **Pinned bitmap color contract:** the adapter treats `Content::Color` as
+  premultiplied RGBA and only swizzles to atlas BGRA, following glyphrast #6.
+  This avoids double-premultiplying COLRv0/v1. At the current pin,
+  `bitmap::decode_png` still returns straight RGBA, making translucent PNG
+  pixels too bright in a premultiplied atlas; `strike::Bitmap::decode`
+  passes raw CBDT premultiplied BGRA through, swapping red/blue in the adapter.
+  These upstream gaps (#6/#15) are deliberately not compensated here.
+  A local merge of #6 fixes both bitmap cases; the dependency pin is unchanged.
 
 * **Bitmap/color bounds require rendering.** `Scaler::scale_outline_into` and
   zeno's public bounds API provide exact plain-outline placement without coverage
@@ -405,3 +405,65 @@ The explicit glyphrast run passed 46/48: the known mono `snap-clip` difference
 `split-batch` difference (1514 pixels, maximum difference 2, tolerance 1510).
 No rasterization code or test tolerances changed in this feature-wiring update.
 Color-font visual checks remain unverified.
+
+## Premultiplied color adapter verification
+
+`Content::Color` now passes through without alpha multiplication: only RGBA
+to BGRA channel order changes. The unit test covers translucent, low-alpha,
+opaque, transparent and empty input. The pin remains `08e742b`.
+
+The comparison probe renders every glyph through `FontContext` in Alpha mode,
+with embedded bitmaps enabled, identity transform and zero offset. Fixtures:
+`colrv0_dejavu.ttf` and `test_glyphs-glyf_colr_1.ttf` at 64px,
+`cbdt.ttf` at its 16/64/128px strikes, and `noto_handwriting-sbix.ttf` at
+its 109px strike. The supplied bitmap fixtures contain PNG, not raw CBDT;
+to exercise raw CBDT, a scratch copy of `cbdt.ttf` converts its PNG payloads
+to premultiplied BGRA, image format 1, bit depth 32 (tested at 64px).
+
+WebRender's FreeType `load_glyph` deliberately sets `FT_LOAD_COLOR` only for
+fixed-size faces because Gecko handles COLR layers. Consequently neither
+COLRv0 nor COLRv1 produces color through that backend in this probe; both use
+direct glyphrast `Render` premultiplied output as the reference instead,
+with the same white foreground and rendering settings. This tests adapter
+fidelity, not independent correctness of the COLR compositor. Bitmap
+references are the unmodified FreeType backend's atlas BGRA output.
+
+Errors below are absolute byte differences on reference pixels with alpha
+1..254, aligned by glyph placement. Maxima and means are listed in **B,G,R**
+order; alpha errors are zero throughout, as are placement/dimension differences.
+Only glyphs containing translucent pixels count in the second column.
+
+| Source/reference | Glyphs / translucent pixels | Pin before: max; mean BGR | Pin after: max; mean BGR | Local #6 after: max; mean BGR |
+| --- | ---: | --- | --- | --- |
+| COLRv0 / glyphrast | 4 / 3671 | 64,63,64; 8.5380,1.5279,5.8910 | 0,0,0; 0,0,0 | 0,0,0; 0,0,0 |
+| COLRv1 / glyphrast | 173 / 51324 | 64,64,64; 24.5823,21.1118,28.6907 | 0,0,0; 0,0,0 | 0,0,0; 0,0,0 |
+| CBDT PNG / FreeType | 9 / 2911 | 0,0,1; 0,0,0.0003 | 127,127,243; 5.5672,5.7314,35.1353 | 0,0,0; 0,0,0 |
+| sbix PNG / FreeType | 6 / 2158 | 1,0,0; 0.0222,0,0 | 201,180,236; 50.3767,51.4717,48.5195 | 0,0,0; 0,0,0 |
+| Raw CBDT (derived) / FreeType | 3 / 915 | 43,15,66; 14.0885,1.2350,21.7432 | 52,0,52; 20.9432,0,20.9432 | 0,0,0; 0,0,0 |
+
+Example COLRv0 translucent BGRA: reference `[0,0,123,123]`, before
+`[0,0,59,123]`, after `[0,0,123,123]`. At the pin, a CBDT PNG reference
+`[1,1,2,2]` becomes `[128,128,245,2]` after the adapter fix (straight RGB
+leaks into a premultiplied atlas). A raw CBDT reference `[20,20,72,76]`
+becomes `[72,20,20,76]` (R/B reversed). These bitmap discrepancies are
+intentionally left for glyphrast #6/#15, not hidden by source-specific code.
+
+For the post-bump check, scratch worktree
+`/home/ubuntu/repos/glyphrast-color-contract` merged `pr/6` (`1f7d942`) into
+`08e742b`, producing local merge `782d013`. A temporary external probe
+`[patch]` selected this checkout; the override was removed afterward and no
+dependency changes were committed. All 18 bitmap glyph images match FreeType
+byte-for-byte after #6, including opaque/transparent pixels. All 203 COLR
+images match the direct reference byte-for-byte, and their raw output is
+unchanged by #6. This does not claim COLR matches FreeType.
+
+`cargo test -p wr_glyph_rasterizer --features fontations`: 10 passed;
+doc-tests: 0 tests, no failures. The pinned glyphrast software text suite:
+47 passing, 1 failing (`snap-clip`, 1 pixel, maximum difference 3); `split-batch`
+passed this run. Color-font visual checks remain unverified.
+
+Reproduction sources and byte dumps are retained under
+`/home/ubuntu/glyphrast-results/`: `color.rs`, `make_raw_cbdt.py`,
+`compare_color.py`, `color-{ft,before,after,post}/`, matching `.log` files,
+and `color-comparison.{txt,json}`. `embedded_bitmaps.ttf` was not used:
+the FreeType backend rejected its 476-byte face at registration (error 143).
