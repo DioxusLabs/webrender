@@ -9,7 +9,7 @@ build = "build.rs"
 edition = "2018"
 
 [features]
-default = ["fontations", "static_freetype"]
+default = ["static_freetype"]
 profiler = ["tracy-rs/enable_profiler"]
 capture = ["api/serialize", "ron", "serde", "smallvec/serde", "etagere/serialization", "glyph_rasterizer/capture"]
 replay = ["api/deserialize", "ron", "serde", "smallvec/serde", "etagere/serialization", "glyph_rasterizer/replay"]
